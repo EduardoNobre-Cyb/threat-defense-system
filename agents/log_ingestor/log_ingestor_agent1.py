@@ -77,22 +77,23 @@ class LogIngestor:
                 file_handle = open(path, "r", encoding="utf-8")
                 print(f"📂 Reading log file: {path}")
 
-            # Detect format (JSON, syslog, CSV, etc..)
+            # Keep file open for entire process
             with file_handle as f:
+                # Detect format (JSON, syslog, CSV, etc..)
                 first_line = f.readline()
                 if not first_line:
                     print(f"⚠️  Empty file: {path}")
                     return events
 
-            # Determine format
-            log_format = self._detect_format(first_line)
-            print(f"🔍 Detected format: {log_format}")
+                # Determine format
+                log_format = self._detect_format(first_line)
+                print(f"🔍 Detected format: {log_format}")
 
-            # Reset to beginning
-            f.seek(0)
+                # Reset to beginning
+                f.seek(0)
 
-            # Parse based on detected format
-            events = self._parse_file(f, log_format, source)
+                # Parse based on detected format
+                events = self._parse_file(f, log_format, source)
 
         except gzip.BadGzipFile:
             print(f"❌ BadGzipFile: {path} appears to be corrupted or not gzipped")

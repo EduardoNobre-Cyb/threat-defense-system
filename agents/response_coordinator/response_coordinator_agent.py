@@ -1471,9 +1471,7 @@ if __name__ == "__main__":
                         "risk_score": threat.risk_score,
                         "asset_name": asset.name if asset else "Unknown",
                         "vulnerability_name": vuln.name if vuln else "Unknown",
-                        "mitre_tactics": (
-                            threat.mitre_tactics or threat.mitre_tactic or ""
-                        ).split(","),
+                        "mitre_tactics": (threat.mitre_tactic or "").split(","),
                         "ioc_matches": hr.ioc_matches or [],
                         "entity_correlations": hr.entity_correlations or [],
                         "ml_correlations": hr.ml_correlations or [],

@@ -30,6 +30,7 @@ from shared.logging_config import setup_agent_logger
 import traceback
 from datetime import datetime, timedelta, timezone
 from dashboard.notification_service import NotificationService
+from agents.classification.ensemble_classifier import EnsembleClassifier
 
 
 class ThreatClassificationAgent:
@@ -79,10 +80,22 @@ class ThreatClassificationAgent:
         self.model_path = os.getenv(
             "ML_MODEL_PATH", "data/models/threat_classifier.pkl"
         )
-        self.last_retrain_time = None
-        self.retrain_interval = 3600  # Retrain every 1 hour (in seconds)
         self.verbose = verbose  # Set to False in listen mode for minimal output
         self.logger = setup_agent_logger(agent_id, verbose)
+        try:
+            self.ensemble = EnsembleClassifier(
+                models_dir="data/models/threat_classifier_v2"
+            )
+            self.ensemble.load_models()
+            self.logger.info(
+                "✅ Loaded ensemble threat classifier (Naive Bayes + SVM + Random Forest)"
+            )
+        except Exception as e:
+            self.logger.error("Failed to load ensemble models: %s.", e)
+            self.ensemble = None
+        self.last_retrain_time = None
+        self.retrain_interval = 3600  # Retrain every 1 hour (in seconds)
+
         # Load or train ML model
         self._load_or_train_classifier()
 
@@ -197,16 +210,55 @@ class ThreatClassificationAgent:
 
                 # Determine severity from CVSS (industry standard)
                 severity = get_severity_from_cvss(cvss_score)
-                decision = self._determine_threat_decision(pair.description or "")
-                threat_type = decision["label"]
+                description = pair.description or ""
+                if self.ensemble:
+                    predictions = self.ensemble.classify_with_confidence(description)
+
+                    base_label = predictions["threat_type"]
+                    confidence = float(predictions["confidence"])
+                    model_agreement = bool(predictions["model_agreement"])
+                    runner_up = predictions.get("runner_up", "Unknown")
+                    runner_up_conf = float(predictions.get("runner_up_confidence", 0.0))
+                    margin = max(0.0, confidence - runner_up_conf)
+
+                    # Routing logic: uncertain cases go to analyst review
+                    if confidence < 0.50 or not model_agreement:
+                        threat_type = "Needs Review"
+                        source = "ensemble_abstain"
+                    elif confidence >= 0.85:
+                        threat_type = base_label
+                        source = "ensemble_high_conf"
+                    else:
+                        threat_type = base_label
+                        source = "ensemble_medium_conf"
+
+                    # Keep decision shape compatible with downstream code
+                    decision = {
+                        "label": threat_type,
+                        "source": source,
+                        "confidence": confidence,
+                        "margin": margin,
+                        "top_candidates": [
+                            {"label": base_label, "score": round(confidence, 4)},
+                            {"label": runner_up, "score": round(runner_up_conf, 4)},
+                        ],
+                        "runner_up": runner_up,
+                        "model_agreement": model_agreement,
+                    }
+                else:
+                    # Fallback to existing NB/rule logic if ensemble is unavailable
+                    decision = self._determine_threat_decision(description)
+                    threat_type = decision["label"]
+
                 mitre_tactic = self._extract_mitre_tactic(pair.description)
 
                 if threat_type == "Needs Review":
                     self.logger.warning(
-                        "⚠️  Classification abstained: %s | Confidence: %.3f | Margin: %.3f",
-                        pair.description[:80] if pair.description else "No description",
-                        decision["confidence"],
-                        decision["margin"],
+                        "⚠️ Ensemble routed to review | base=%s conf =%.3f agree=%s runner_up=%s",
+                        base_label,
+                        confidence,
+                        model_agreement,
+                        runner_up,
                     )
 
                 # Still compute risk/severity for triage purposes, even if threat type is uncertain
@@ -215,7 +267,7 @@ class ThreatClassificationAgent:
                 if self.verbose:
                     self.logger.info("Exploitability Score: %.2f/10", (exploitability))
                     self.logger.info("Impact Score: %.2f/10", impact)
-                    self.logger.info("Risk Score: %.2f/10", risk)
+                    self.logger.info("Risk Score: %.2f/10", risk_score)
                     self.logger.info("Severity: %s", severity)
                     self.logger.info("Threat Type: %s", threat_type)
                     self.logger.info("MITRE Tactic: %s", mitre_tactic)
@@ -230,7 +282,7 @@ class ThreatClassificationAgent:
                 else:
                     self.logger.debug("Exploitability Score: %.2f/10", (exploitability))
                     self.logger.debug("Impact Score: %.2f/10", impact)
-                    self.logger.debug("Risk Score: %.2f/10", risk)
+                    self.logger.debug("Risk Score: %.2f/10", risk_score)
                     self.logger.debug("Severity: %s", severity)
                     self.logger.debug("Threat Type: %s", threat_type)
                     self.logger.debug("MITRE Tactic: %s", mitre_tactic)
@@ -555,94 +607,68 @@ class ThreatClassificationAgent:
 
         # Load existing classifier model or train a new one.
 
-        if os.path.exists(self.model_path):
-            ("Loading existing classifier model...")
+        if self.ensemble and hasattr(self.ensemble, "models") and self.ensemble.models:
+            self.logger.info("✅ Ensemble models already loaded, skipping training.")
+            return
+
+        # If ensemble isnt available
+        if not self.ensemble:
+            self.logger.warning("Ensemble not available. Training a new one...")
             try:
-                with open(self.model_path, "rb") as f:
-                    self.classifier_model = pickle.load(f)
-                ("Successfully loaded existing ML model")
+                self.ensemble = EnsembleClassifier(
+                    models_dir="data/models/threat_classifier"
+                )
             except Exception as e:
-                self.logger.error("Failed to load model: %s. Training new one...", e)
-                self._train_classifier()
-        else:
-            self.logger.warning("No existing model found. Training new classifier...")
-            self._train_classifier()
+                self.logger.error("Failed to initialize ensemble: %s", e)
+                return
+
+        self._train_ensemble()
 
     def _train_classifier(self):
         """Train ML classifier with real CVE data from external APIs."""
-        self.logger.info("Training ML model with external CVE data...")
+        self._train_ensemble()
 
-        # First, try to get training data from external CVE sources
-        training_texts, training_labels = self._fetch_cve_training_data()
+    def _train_ensemble(self):
+        """Train ensemble with diverse data sources."""
+        self.logger.info(
+            "🔄 Training ensemble classifier with CVE data and curated samples..."
+        )
 
-        # Fallback to database vulnerabilities if external data not available
-        if len(training_texts) < 50:  # Need minimum dataset
+        # Fetch training data from external CVE sources
+        training_text, training_labels = self._fetch_cve_training_data()
+
+        # Fallback to database vulnerabilities if external fails
+        if len(training_text) < 50:
             self.logger.warning(
-                "External CVE data insufficient, using database vulnerabilities..."
+                "External CVE data insufficient (%d samples). Fetching from database...",
+                len(training_text),
             )
-            db_texts, db_labels = self._get_database_training_data()
-            training_texts.extend(db_texts)
+            db_text, db_labels = self._get_database_training_data()
+            training_text.extend(db_text)
             training_labels.extend(db_labels)
 
-        if not training_texts:
+        if not training_text:
             self.logger.error("No training data available. Cannot train classifier.")
             return
 
-        # Create training data with diverse threat types
-        self.logger.debug("Total training samples: %d", len(training_texts))
+        self.logger.debug("Total training samples: %d", len(training_text))
 
-        # Print training data distribution for debugging
+        # Check data distribution
         from collections import Counter
 
         label_counts = Counter(training_labels)
+        self.logger.info("Training data distribution: %s", dict(label_counts))
 
-        # Checks to prevent silently training a brittle model on imbalanced data
-        min_samples_per_class = 3
-        underrepresented = [
-            label
-            for label, count in label_counts.items()
-            if count < min_samples_per_class
-        ]
-
-        if underrepresented:
-            self.logger.warning(
-                "Underrepresented classes (<%d samples): %s",
-                min_samples_per_class,
-                underrepresented,
+        # Train ensemble
+        try:
+            self.ensemble.train_ensemble(training_text, training_labels)
+            self.ensemble.save_models()
+            self.logger.info(
+                "✅ Training ensemble (NB + SVM + RF) on %d samples.",
+                len(training_text),
             )
-
-        if len(label_counts) < 5:
-            self.logger.warning(
-                "Low class diversite (%d classes). Expect weak generalization.",
-                len(label_counts),
-            )
-
-        # Only train if we have diverse labels
-        if len(set(training_labels)) < 3:
-            self.logger.warning(
-                " Only %s unique labels. Model may not be effective.",
-                len(set(training_labels)),
-            )
-
-        # Calibration to improve confidence reliability (important for gating)
-        from sklearn.calibration import CalibratedClassifierCV
-
-        # Train TF-IDF + Naive Bayes classifier
-        base_nb = make_pipeline(
-            TfidfVectorizer(max_features=500, ngram_range=(1, 2)), MultinomialNB()
-        )
-
-        self.classifier_model = CalibratedClassifierCV(base_nb, method="sigmoid", cv=3)
-
-        # Save the model
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        with open(self.model_path, "wb") as f:
-            pickle.dump(self.classifier_model, f)
-
-        self.logger.debug(
-            "Trained classifier on %d samples from external CVE data.",
-            len(training_texts),
-        )
+        except Exception as e:
+            self.logger.error("Failed to train ensemble: %s", e)
 
     def _fetch_cve_training_data(self):
         """Fetch training data from database (classified by agents) or fallback to hardcoded examples."""

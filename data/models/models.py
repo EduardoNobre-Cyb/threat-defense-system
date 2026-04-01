@@ -127,8 +127,19 @@ class ThreatClassification(Base):
     impact_score = Column(Float)
     risk_score = Column(Float)
     mitre_tactic = Column(String)
-    mitre_tactics = Column(String)  # Add this field for multiple tactics
     severity = Column(String)
+
+    ensemble_confidence = Column(
+        Float
+    )  # Confidence score from ensemble (0-1 avg confidence across 3 models)
+    model_agreement = Column(
+        Boolean
+    )  # True if all 3 models agreed on the same decision
+    classification_runner_up = Column(
+        String(100), nullable=True
+    )  # Second choice if uncertain
+    runner_up_confidence = Column(Float, nullable=True)  # Confidence in backup choice
+
     timestamp = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

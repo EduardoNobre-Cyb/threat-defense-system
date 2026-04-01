@@ -1468,8 +1468,22 @@ class ThreatModelAgent:
         """Add attack edges from attack graph to database. Returns edge count."""
         edge_count = 0
         for edge in attack_graph["edges"]:
-            from_node_id = edge["from"]
-            to_node_id = edge["to"]
+            # Handle both dict and object formats
+            from_node_id = (
+                edge.get("from")
+                if isinstance(edge, dict)
+                else getattr(edge, "source_asset_id", None)
+            )
+            to_node_id = (
+                edge.get("to")
+                if isinstance(edge, dict)
+                else getattr(edge, "target_asset_id", None)
+            )
+
+            # Skip if we can't get node IDs
+            if not from_node_id or not to_node_id:
+                continue
+
             from_asset = next(
                 (
                     a
@@ -1487,8 +1501,18 @@ class ThreatModelAgent:
                 None,
             )
             if from_asset and to_asset:
+                attack_technique = (
+                    edge.get("attack_technique")
+                    if isinstance(edge, dict)
+                    else getattr(edge, "attack_technique", "exploitation")
+                )
+                difficulty = (
+                    edge.get("difficulty")
+                    if isinstance(edge, dict)
+                    else getattr(edge, "difficulty", "medium")
+                )
                 self.add_attack_edge_db(
-                    from_asset, to_asset, edge["attack_technique"], edge["difficulty"]
+                    from_asset, to_asset, attack_technique, difficulty
                 )
                 edge_count += 1
         return edge_count
@@ -1869,7 +1893,26 @@ class ThreatModelAgent:
             # Store attack paths in database
             self._store_attack_paths_to_db(ranked_edges, nodes)
 
-            return ranked_edges
+            # Convert AttackPath objects back to dictionaries for JSON serialization
+            edges_dicts = []
+            for edge in ranked_edges:
+                if isinstance(edge, dict):
+                    edges_dicts.append(edge)
+                else:
+                    # Convert AttackPath ORM object to dictionary
+                    edges_dicts.append(
+                        {
+                            "from": getattr(edge, "source_asset_id", None),
+                            "to": getattr(edge, "target_asset_id", None),
+                            "attack_technique": getattr(
+                                edge, "attack_technique", "exploitation"
+                            ),
+                            "difficulty": getattr(edge, "difficulty", "medium"),
+                            "risk_score": getattr(edge, "risk_score", 0.0),
+                        }
+                    )
+
+            return edges_dicts
         return edges
 
     def _store_attack_paths_to_db(self, ranked_edges: List, nodes: List[Dict]):
