@@ -132,35 +132,6 @@ Mail:
 - The database schema is generated from code-first SQLAlchemy models.
 - Neo4j and Redis are included in the compose stack for full agent functionality.
 
-### Export Full Model Version History (No Terminal Truncation)
-
-Use CSV export from PostgreSQL to capture all rows from models table:
-
-```bash
-docker compose exec postgres psql -U threatuser -d threatdefense -c "\\copy models to '/tmp/models_full.csv' csv header"
-docker compose cp postgres:/tmp/models_full.csv ./models_full.csv
-```
-
-If you want schema + data in SQL form for lecturers:
-
-```bash
-docker compose exec postgres pg_dump -U threatuser -d threatdefense --table=models > models_full.sql
-```
-
-### Import Existing Database Into Docker Compose
-
-If you already have a PostgreSQL dump and want Docker to use it as-is:
-
-```bash
-docker compose up -d postgres
-docker compose exec -T postgres dropdb -U threat_user --if-exists threat_modeling
-docker compose exec -T postgres createdb -U threat_user threat_modeling
-docker compose exec -T postgres pg_restore -U threat_user -d threat_modeling --clean --if-exists < full_db.dump
-SKIP_DB_SEED=true docker compose up -d app redis neo4j
-```
-
-Use `SKIP_DB_SEED=true` to prevent startup seed data from overwriting imported `analysts` and `external_iocs` rows.
-
 ## License
 
 Academic project submission.
