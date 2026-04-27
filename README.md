@@ -1,6 +1,6 @@
 # Threat Defense System
 
-Final-year cybersecurity multi-agent platform for ingesting logs, classifying threats, detecting patterns/anomalies, generating attack paths, and coordinating response actions through a live analyst dashboard.
+3rd Year cybersecurity multi-agent platform for ingesting logs, classifying threats, detecting patterns/anomalies, generating attack paths, and coordinating response actions through a live analyst dashboard.
 
 ## Features
 
