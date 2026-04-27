@@ -1,94 +1,166 @@
-# Threat Defense System - Project Structure
+# Threat Defense System
 
-## Current Structure
+Final-year cybersecurity multi-agent platform for ingesting logs, classifying threats, detecting patterns/anomalies, generating attack paths, and coordinating response actions through a live analyst dashboard.
 
-### 📁 **agents/** - Multi-Agent System Components
+## Features
 
-Contains the core intelligent agents that form the backbone of the threat detection pipeline:
+- Agent 1 (Threat Modeling): attack graph generation with Neo4j and MITRE ATT&CK mapping
+- Agent 2 (Classification): ML-based threat classification and confidence scoring
+- Agent 3 (Threat Hunting): IOC correlation, anomaly/pattern detection
+- Agent 4 (Response Coordinator): automated response flow and analyst support actions
+- Analyst Dashboard: Flask + SocketIO UI for monitoring, reviewing threats, and operating agents
+- PostgreSQL persistence via SQLAlchemy models in [data/models/models.py](data/models/models.py)
+- Redis message bus for inter-agent communication and heartbeat tracking
 
-- **classification/** - Machine Learning agent that classifies security events and assigns threat severity scores
-- **log_ingestor/** - Log Ingestor Agent that ingests, parses, and normalizes security logs from various sources (systems, firewalls, etc.)
-- **threat_hunter/** - Threat Hunting Agent that detects anomalies through pattern matching and baseline learning
-- **response_coordinator/** - Response Coordinator Agent that orchestrates and executes automated remediation actions
-- **threat_modeling/** - Threat Modeling Agent that performs attack path analysis, ranks risks, and integrates MITRE ATT&CK framework
+## Tech Stack
 
-**Purpose:** Each agent handles a specific stage of the threat detection and response pipeline, working together through message buses to provide intelligent security analysis.
+- Python, Flask, Flask-SocketIO
+- SQLAlchemy + PostgreSQL
+- Redis (pub/sub + heartbeat/status)
+- Neo4j (attack graph storage and traversal)
+- scikit-learn / NumPy / Pandas (ML)
 
----
+## Quick Start (Docker, Recommended)
 
-### 📁 **data/** - Data Storage & Machine Learning Models
+Prerequisites:
 
-Contains training data, ML models, and security intelligence databases:
+- Docker
+- Docker Compose
+- Git LFS (required if committing model artifacts in data/models)
 
-- **attack_patterns_for_training.py** - Training dataset for threat classification models
-- **expanded_attack_patterns_for_training.py** - Extended attack patterns for improved model accuracy
-- **modern_cves_for_testing.py** - Recently discovered CVE data for validation and testing
-- **cvss_utils.py** - Utilities for CVSS severity scoring calculations
-- **mitre/enterprise-attack.json** - Complete MITRE ATT&CK framework database (tactics, techniques)
-- **models/** - Pre-trained ML models (`threat_classifier.pkl`, `threat_hunter.pkl`) and model definitions
+Compose command compatibility:
 
-**Purpose:** Provides all data assets needed for the agents to operate: training data for ML models, MITRE ATT&CK context for threat analysis, and CVSS utilities for vulnerability scoring.
+- Use docker compose if your system has the Compose plugin.
+- Use docker-compose if docker compose is not available.
 
----
+From the project root:
 
-### 📁 **shared/** - Cross-Agent Utilities
-
-Contains shared services used by all agents:
-
-- **communication/message_bus.py** - Inter-agent message communication system (agents use this to coordinate and share threat intelligence)
-- **logging_config.py** - Centralized logging configuration ensuring consistent logging across all agents
-
-**Purpose:** Provides the infrastructure for agent-to-agent communication and unified system logging.
-
----
-
-### 📁 **vulnerability_enrichment/** - CVE Data Management
-
-Handles integration with external vulnerability databases:
-
-- **cve_fetcher.py** - Fetches latest CVE data from external sources (NVD, security databases)
-- **cve_scheduler.py** - Schedules periodic automatic updates of CVE intelligence
-- **test_api.py** - Tests connectivity and verifies CVE data source availability
-
-**Purpose:** Keeps the system updated with the latest vulnerability information to improve threat detection accuracy.
-
----
-
-## System Flow
-
-```
-Raw Security Logs
-        ↓
-   [Log Ingestor Agent]  → Normalizes and parses logs
-        ↓
-   [Classification Agent] → Categorizes threats & assigns severity
-        ↓
-   [Threat Hunter Agent]  → Detects anomalies via patterns
-        ↓
-   [Threat Modeling]      → Analyzes attack paths & risk ranking
-        ↓
-[Response Coordinator]    → Executes automated responses
-        ↓
-   Alert & Action Taken
+```bash
+docker compose up --build
 ```
 
----
+If your environment uses docker-compose:
 
-## Key Technologies
+```bash
+docker-compose up --build
+```
 
-- **Machine Learning:** ML agents for threat classification and behavior analysis
-- **MITRE ATT&CK:** Framework for mapping detected techniques to known attack tactics
-- **CVSS Scoring:** Standardized vulnerability severity assessment
-- **Multi-Agent Architecture:** Event-driven agent system with message-based communication
+What this starts:
 
----
+- Dashboard/API: http://localhost:5000
+- PostgreSQL: localhost:5432
+- Redis: localhost:6379
+- Neo4j Browser: http://localhost:7474
+- Neo4j Bolt: localhost:7687
 
-## Dependencies
+On startup, the app container automatically:
 
-- Python 3.13+
-- Machine learning libraries (scikit-learn, joblib)
-- External APIs (NVD for CVE data)
+- waits for PostgreSQL
+- creates all SQLAlchemy tables from [data/models/models.py](data/models/models.py)
+- seeds only [analysts](data/models/models.py) and [external_iocs](data/models/models.py) with the fixed review dataset
 
----
+Seeded analysts and IOC records are defined in [scripts/init_database.py](scripts/init_database.py).
 
-_Created for 3rd Year Project - Cybersecurity Threat Defense System_
+## Local Development (Without Docker)
+
+1. Create and activate a virtual environment.
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Copy environment template and edit values:
+
+```bash
+cp .env.example .env
+```
+
+4. Provide environment variables (example below).
+5. Run the dashboard:
+
+```bash
+python -m dashboard.app
+```
+
+## Environment Variables
+
+Core:
+
+- DATABASE_URL (required)
+- JWT_SECRET_KEY (required)
+
+Service connectivity:
+
+- REDIS_HOST (default: localhost)
+- REDIS_PORT (default: 6379)
+- REDIS_DB (default: 0)
+- NEO4J_URI (default: bolt://localhost:7687)
+- NEO4J_USERNAME (default: neo4j)
+- NEO4J_PASSWORD (default: neo4j)
+
+Optional integrations:
+
+- VULNERS_API_KEY (optional, CVE enrichment is disabled if unset)
+- SLACK_WEBHOOK_URL
+- TEAMS_WEBHOOK_URL
+- SLACK_ENABLED (true/false)
+- TEAMS_ENABLED (true/false)
+
+Mail:
+
+- MAIL_SERVER
+- MAIL_PORT
+- MAIL_USE_TLS
+- MAIL_USE_SSL
+- MAIL_USERNAME
+- MAIL_PASSWORD
+- MAIL_DEFAULT_SENDER
+
+## Project Structure
+
+- [agents](agents): all 4 core agents
+- [dashboard](dashboard): web dashboard + API routes
+- [data](data): training data, MITRE dataset, SQLAlchemy models
+- [shared](shared): message bus and logging utilities
+- [vulnerability_enrichment](vulnerability_enrichment): CVE fetch and scheduler logic
+- [scripts](scripts): ML training/retraining scripts
+
+## Notes for Lecturers and Reviewers
+
+- The easiest reproducible setup is Docker Compose.
+- The database schema is generated from code-first SQLAlchemy models.
+- Neo4j and Redis are included in the compose stack for full agent functionality.
+
+### Export Full Model Version History (No Terminal Truncation)
+
+Use CSV export from PostgreSQL to capture all rows from models table:
+
+```bash
+docker compose exec postgres psql -U threatuser -d threatdefense -c "\\copy models to '/tmp/models_full.csv' csv header"
+docker compose cp postgres:/tmp/models_full.csv ./models_full.csv
+```
+
+If you want schema + data in SQL form for lecturers:
+
+```bash
+docker compose exec postgres pg_dump -U threatuser -d threatdefense --table=models > models_full.sql
+```
+
+### Import Existing Database Into Docker Compose
+
+If you already have a PostgreSQL dump and want Docker to use it as-is:
+
+```bash
+docker compose up -d postgres
+docker compose exec -T postgres dropdb -U threat_user --if-exists threat_modeling
+docker compose exec -T postgres createdb -U threat_user threat_modeling
+docker compose exec -T postgres pg_restore -U threat_user -d threat_modeling --clean --if-exists < full_db.dump
+SKIP_DB_SEED=true docker compose up -d app redis neo4j
+```
+
+Use `SKIP_DB_SEED=true` to prevent startup seed data from overwriting imported `analysts` and `external_iocs` rows.
+
+## License
+
+Academic project submission.

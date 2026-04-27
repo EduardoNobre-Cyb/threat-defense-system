@@ -14,6 +14,9 @@ from sqlalchemy import select
 from shared.logging_config import setup_agent_logger
 import pickle
 import os
+from .threat_intel import ThreatIntelClient
+from data.models.models import ExternalIOC, get_session
+from opentelemetry import trace, metrics
 
 
 IOCS = [
@@ -80,6 +83,7 @@ def normalise_tactic(tactic: str) -> str:
 class ThreatHunterAgent:
     def __init__(self, agent_id: str = "hunter_001", verbose: bool = True):
         self.agent_id = agent_id
+        self.intel_client = ThreatIntelClient()
         self.recent_threats = []  # Stores (timestamp, classification) tuples
         self.correlation_window = 300  # seconds (5 minutes)
         self.anomaly_detector = AnomalyDetector(
@@ -94,6 +98,26 @@ class ThreatHunterAgent:
         self.pattern_model = None
         self.pattern_scaler = None
         self.load_pattern_model()  # Attempt to load trained pattern detection model
+
+        # Fetch and store threat intelligence indicators on startup
+        self.logger.info(
+            "Fetching threat intelligence indicators from external APIs..."
+        )
+        try:
+            stored = self.intel_client.fetch_and_store_indicators()
+            if stored > 0:
+                self.logger.info(
+                    f"✅ Threat intelligence ready with {stored} indicators"
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not fetch threat intel on startup: {e}")
+
+        # Initialize OpenTelemetry tracing
+        self.tracer = trace.get_tracer(self.agent_id)
+        self.meter = metrics.get_meter(self.agent_id)
+        self.hunt_time = self.meter.create_histogram("hunt_latency_ms")
+        self.hunted_threats = self.meter.create_counter("threats_hunted")
+        self.correlations_found = self.meter.create_counter("correlations_detected")
 
     def load_pattern_model(self):
         """Load trained pattern detection model if available"""
@@ -130,6 +154,25 @@ class ThreatHunterAgent:
         self.logger.warning(
             "Pattern model not found in any location - Using rule-based patterns only."
         )
+
+    def load_model(self, model_path: str) -> None:
+        """Hot-reload the pattern detection model from a new path."""
+
+        try:
+            self.logger.info(f"🔄 Hot-reloading pattern model from {model_path}")
+            if os.path.exists(model_path):
+                with open(model_path, "rb") as f:
+                    data = pickle.load(f)
+                    self.pattern_model = data.get("model")
+                    self.pattern_scaler = data.get("scaler")
+                self.logger.info("✅ Pattern model reloaded successfully")
+            else:
+                self.logger.error(f"Model file not found: {model_path}")
+                raise FileNotFoundError(f"Model file not found: {model_path}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to reload pattern model: {e}")
+            # Don't clear the pattern model on failure - keep using the old one
+            raise
 
     def _extract_sequence_features(self, threat_sequence):
         """Extract numeric features from threat sequence for ML prediction"""
@@ -184,8 +227,12 @@ class ThreatHunterAgent:
         message_bus.subscribe("classified_threats", self.handle_classified_threat)
 
     def handle_classified_threat(self, message, print_results=True):
-        # Support both single and multiple classified threats
-        classifications = message.get("classification", {})
+        """Handle individual classified threat: dedup, correlate, hunt, save to DB, publish"""
+        with self.tracer.start_as_current_span("handle_classified_threat") as span:
+            start = time.time()
+
+            # Support both single and multiple classified threats
+            classifications = message.get("classification", {})
         # If it's a dict, wrap in a list for uniform processing
         if isinstance(classifications, dict):
             classifications = [classifications]
@@ -242,11 +289,42 @@ class ThreatHunterAgent:
             severity = classification.get("severity", "unknown")
             mitre = classification.get("mitre_tactics", [])
             risk_score = classification.get("risk_score", 0)
+            prediction_confidence = classification.get("prediction_confidence")
 
             self.logger.debug(f"Received classified threat: {classification}")
 
             # Call match_iocs to find matching IOCs
             ioc_matches = self.match_iocs(classification)
+
+            # External threat intel matching
+            external_ioc_matches = self.intel_client.hunt_with_external_iocs(
+                classification
+            )
+            if external_ioc_matches:
+                self.logger.warning(
+                    f"🔗 External IOC matches found: {len(external_ioc_matches)}"
+                )
+                for match in external_ioc_matches:
+                    self.logger.warning(
+                        f"  - {match.get('type', 'unknown')}: {match['ioc']} "
+                        f"(Actor: {match.get('threat_actor', 'Unknown')}) "
+                        f"(Source: {match.get('source', 'unknown')})"
+                    )
+                # Merge external IOCs with existing matches
+                ioc_matches.extend(external_ioc_matches)
+            else:
+                self.logger.debug(f"  No external IOC matches for this threat")
+
+            # Identifying threat actor if IOCs found
+            if external_ioc_matches:
+                all_iocs = [m["ioc"] for m in external_ioc_matches]
+                threat_actors = self.intel_client.identify_threat_actor(all_iocs)
+                if threat_actors:
+                    self.logger.info(
+                        "🎭 Potential threat actors identified: "
+                        + ", ".join(threat_actors)
+                    )
+                    classification["identified_actors"] = threat_actors
 
             hunting_result = {
                 "threat_id": classification.get("id"),
@@ -259,6 +337,7 @@ class ThreatHunterAgent:
                 "threat_level": severity,
                 "mitre_tactics": mitre,
                 "risk_score": risk_score,
+                "ensemble_confidence": prediction_confidence,  # Include confidence from Agent 2
                 "details": f"Hunting for {threat_type} threats with severity {severity} and risk score {risk_score}",
                 "correlated_events": correlated_events,
                 "ml_correlated_events": ml_correlated,
@@ -469,223 +548,223 @@ class ThreatHunterAgent:
         """
         Enhanced threat hunting with anomaly detection and pattern matching.
         """
-        hunting_results = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "threats_analyzed": len(classified_threats),
-            "threats": [],
-            "anomalies_detected": [],
-            "patterns_detected": [],
-            "ml_detected_patterns": [],
-        }
+        with self.tracer.start_as_current_span("hunt_threats") as span:
+            span.set_attribute("threat_count", len(classified_threats))
+            start = time.time()
 
-        # PRE-WARM: build the threat_history baseline from the full batch before
-        # running detection, so every threat in the batch benefits from the same
-        # context rather than the first min_samples threats always hitting the
-        # insufficient-baseline fallback.
-        for threat in classified_threats:
-            pre_sev = self._severity_to_numeric(threat.get("severity", "Medium"))
-            pre_risk = float(threat.get("risk_score", 5.0))
-            self.anomaly_detector.add_threat(pre_sev, pre_risk)
+            hunting_results = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "threats_analyzed": len(classified_threats),
+                "threats": [],
+                "anomalies_detected": [],
+                "patterns_detected": [],
+                "ml_detected_patterns": [],
+            }
 
-        for threat in classified_threats:
-            # Extract threat data
-            threat_id = threat.get("id")
-            threat_type = threat.get("threat_type")
-            severity = threat.get("severity", "Medium")
-            risk_score = threat.get("risk_score", 5.0)
-            mitre_tactics = threat.get("mitre_tactics", [])
+            # Pre-warm anomaly detector with full batch
+            for threat in classified_threats:
+                pre_sev = self._severity_to_numeric(threat.get("severity", "Medium"))
+                pre_risk = float(threat.get("risk_score", 5.0))
+                self.anomaly_detector.add_threat(pre_sev, pre_risk)
 
-            self.logger.debug(
-                "Hunting threat #%s | Type: %s | Severity: %s | Risk: %.2f",
-                threat_id,
-                threat_type,
-                severity,
-                risk_score,
-            )
+            for threat in classified_threats:
+                # Extract threat data
+                threat_id = threat.get("id")
+                threat_type = threat.get("threat_type")
+                severity = threat.get("severity", "Medium")
+                risk_score = threat.get("risk_score", 5.0)
+                mitre_tactics = threat.get("mitre_tactics", [])
 
-            # Convert severity string to numeric
-            severity_score = self._severity_to_numeric(severity)
-
-            # 1. Traditional hunting (IOC matching + correlation) - EXISTING CODE
-            ioc_matches = self.match_iocs(threat)
-            entity_correlations = self.correlate_by_entity(threat)
-            ml_correlations = self.correlate_by_ml(threat)
-
-            self.logger.debug(
-                "  IOC matches: %d | Entity correlations: %d | ML correlations: %d",
-                len(ioc_matches),
-                len(entity_correlations),
-                len(ml_correlations),
-            )
-
-            # 2. ADD ANOMALY DETECTION
-            self.anomaly_detector.add_threat(severity_score, risk_score)
-            anomaly_result = self.anomaly_detector.detect_anomalies(
-                severity_score=severity_score,
-                risk_score=risk_score,
-                threat_count_increase=len(
-                    classified_threats
-                ),  # How many threats came in batch
-            )
-
-            if anomaly_result["is_anomalous"]:
                 self.logger.debug(
-                    "  ⚠️  Anomaly detected (score: %.2f) — %s",
-                    anomaly_result["anomaly_score"],
-                    "; ".join(anomaly_result.get("reasons", [])),
+                    "Hunting threat #%s | Type: %s | Severity: %s | Risk: %.2f",
+                    threat_id,
+                    threat_type,
+                    severity,
+                    risk_score,
+                )
+
+                # Convert severity string to numeric
+                severity_score = self._severity_to_numeric(severity)
+
+                # Traditional hunting (IOC matching + correlation)
+                ioc_matches = self.match_iocs(threat)
+                entity_correlations = self.correlate_by_entity(threat)
+                ml_correlations = self.correlate_by_ml(threat)
+
+                self.logger.debug(
+                    "  IOC matches: %d | Entity correlations: %d | ML correlations: %d",
+                    len(ioc_matches),
+                    len(entity_correlations),
+                    len(ml_correlations),
+                )
+
+                # Anomaly detection
+                self.anomaly_detector.add_threat(severity_score, risk_score)
+                anomaly_result = self.anomaly_detector.detect_anomalies(
+                    severity_score=severity_score,
+                    risk_score=risk_score,
+                    threat_count_increase=len(
+                        classified_threats
+                    ),  # How many threats came in batch
+                )
+
+                if anomaly_result["is_anomalous"]:
+                    self.logger.debug(
+                        "  ⚠️  Anomaly detected (score: %.2f) — %s",
+                        anomaly_result["anomaly_score"],
+                        "; ".join(anomaly_result.get("reasons", [])),
+                    )
+                    hunting_results["anomalies_detected"].append(
+                        {
+                            "threat_id": threat_id,
+                            "threat_type": threat_type,
+                            "anomaly_score": anomaly_result["anomaly_score"],
+                            "reasons": anomaly_result["reasons"],
+                            "details": anomaly_result["details"],
+                        }
+                    )
+
+                self.pattern_matcher.add_threat_to_sequence(
+                    threat_type=threat_type,
+                    severity=severity_score,
+                    mitre_tactics=mitre_tactics,
+                    threat_id=threat_id,
+                )
+
+                # Compile threat hunting record
+                threat_record = {
+                    "threat_id": threat_id,
+                    "threat_type": threat_type,
+                    "severity": severity,
+                    "risk_score": risk_score,
+                    "mitre_tactics": mitre_tactics,
+                    "ioc_matches": ioc_matches,
+                    "entity_correlations": entity_correlations,
+                    "ml_correlations": ml_correlations,
+                    "anomaly_detected": anomaly_result["is_anomalous"],
+                    "anomaly_score": anomaly_result["anomaly_score"],
+                }
+
+                hunting_results["threats"].append(threat_record)
+
+            # Check for surge of critical threats in batch
+            critical_in_batch = sum(
+                1
+                for t in classified_threats
+                if self._severity_to_numeric(t.get("severity", "Medium")) >= 9.0
+            )
+            if critical_in_batch >= self.anomaly_detector.min_samples:
+                surge_score = round(
+                    min(0.5 + critical_in_batch / (len(classified_threats) * 2), 0.95),
+                    2,
                 )
                 hunting_results["anomalies_detected"].append(
                     {
-                        "threat_id": threat_id,
-                        "threat_type": threat_type,
-                        "anomaly_score": anomaly_result["anomaly_score"],
-                        "reasons": anomaly_result["reasons"],
-                        "details": anomaly_result["details"],
+                        "threat_id": None,
+                        "threat_type": "Threat Surge",
+                        "anomaly_score": surge_score,
+                        "reasons": [
+                            f"Surge of {critical_in_batch} critical-severity threats in a single batch",
+                            f"{critical_in_batch}/{len(classified_threats)} threats rated Critical — sustained high-severity activity",
+                        ],
+                        "details": {
+                            "critical_count": critical_in_batch,
+                            "total_batch": len(classified_threats),
+                            "baseline_available": True,
+                        },
                     }
                 )
 
-            # ADD PATTERN MATCHER (LEGACY - TO BE REMOVED)
-            # Pattern matching is now handled by ML model only
-            # Keeping this call for backward compatibility, but patterns_detected is deprecated
-            self.pattern_matcher.add_threat_to_sequence(
-                threat_type=threat_type,
-                severity=severity_score,
-                mitre_tactics=mitre_tactics,
-                threat_id=threat_id,
+            # ML-based pattern detection (if model available) - runs once per hunt batch
+            if (
+                self.pattern_model
+                and self.pattern_scaler
+                and len(classified_threats) >= 2
+            ):
+                try:
+                    # Get recent threats as sequence
+                    recent_threats = [
+                        {
+                            "threat_type": t.get("threat_type"),
+                            "severity": t.get("severity"),
+                            "mitre_tactics": t.get("mitre_tactics", []),
+                            "risk_score": t.get("risk_score", 5.0),
+                            "time_delta": 0,
+                        }
+                        for t in classified_threats[-10:]
+                    ]
+
+                    if len(recent_threats) >= 2:
+                        features = self._extract_sequence_features(recent_threats)
+                        features_scaled = self.pattern_scaler.transform(features)
+                        is_pattern = self.pattern_model.predict(features_scaled)[0]
+                        pattern_confidence = np.max(
+                            self.pattern_model.predict_proba(features_scaled)
+                        )
+
+                        if is_pattern and pattern_confidence >= 0.65:
+                            # Build detailed description with actual threat data
+                            threat_types = [
+                                t.get("threat_type", "Unknown") for t in recent_threats
+                            ]
+                            threat_types_unique = ", ".join(dict.fromkeys(threat_types))
+
+                            severities = [
+                                t.get("severity", "Unknown") for t in recent_threats
+                            ]
+                            avg_severity = sum(s == "Critical" for s in severities)
+
+                            all_tactics = []
+                            for t in recent_threats:
+                                all_tactics.extend(t.get("mitre_tactics", []))
+                            tactics_str = (
+                                ", ".join(list(set(all_tactics))[:3])
+                                if all_tactics
+                                else "Unknown"
+                            )
+
+                            avg_risk = (
+                                sum(t.get("risk_score", 0) for t in recent_threats)
+                                / len(recent_threats)
+                                if recent_threats
+                                else 0
+                            )
+
+                            detailed_description = (
+                                f"Coordinated attack sequence ({len(recent_threats)} threats): {threat_types_unique}. "
+                                f"Severity distribution: {', '.join(severities)}. "
+                                f"MITRE tactics: {tactics_str}. "
+                                f"Average risk score: {avg_risk:.1f}/10. "
+                                f"ML confidence: {pattern_confidence:.1%}"
+                            )
+
+                            hunting_results["ml_detected_patterns"].append(
+                                {
+                                    "pattern": "Coordinated Attack Sequence",
+                                    "description": detailed_description,
+                                    "confidence": float(pattern_confidence),
+                                }
+                            )
+                            self.logger.debug(
+                                "  🎯 ML pattern detected with confidence %.2f: %s",
+                                pattern_confidence,
+                                detailed_description,
+                            )
+                except Exception as e:
+                    self.logger.error(f"Pattern detection failed: {e}", exc_info=True)
+
+            self.logger.debug(
+                "Hunt complete | Threats: %d | Anomalies: %d | Patterns: %d",
+                len(hunting_results["threats"]),
+                len(hunting_results["anomalies_detected"]),
+                len(hunting_results["ml_detected_patterns"]),
             )
 
-            # Compile threat hunting record
-            threat_record = {
-                "threat_id": threat_id,
-                "threat_type": threat_type,
-                "severity": severity,
-                "risk_score": risk_score,
-                "mitre_tactics": mitre_tactics,
-                "ioc_matches": ioc_matches,
-                "entity_correlations": entity_correlations,
-                "ml_correlations": ml_correlations,
-                "anomaly_detected": anomaly_result["is_anomalous"],
-                "anomaly_score": anomaly_result["anomaly_score"],
-            }
+            latency_ms = (time.time() - start) * 1000
+            self.hunt_time.record(latency_ms)
+            self.hunted_threats.add(len(classified_threats))
 
-            hunting_results["threats"].append(threat_record)
-
-        # BATCH-LEVEL SURGE CHECK
-        # Z-scores can't fire when all threats share the same CVSS score (std=0).
-        # This check fires once per hunt when a large volume of high-severity
-        # threats arrives in a single batch — that volume itself is anomalous.
-        critical_in_batch = sum(
-            1
-            for t in classified_threats
-            if self._severity_to_numeric(t.get("severity", "Medium")) >= 9.0
-        )
-        if critical_in_batch >= self.anomaly_detector.min_samples:
-            surge_score = round(
-                min(0.5 + critical_in_batch / (len(classified_threats) * 2), 0.95), 2
-            )
-            hunting_results["anomalies_detected"].append(
-                {
-                    "threat_id": None,
-                    "threat_type": "Threat Surge",
-                    "anomaly_score": surge_score,
-                    "reasons": [
-                        f"Surge of {critical_in_batch} critical-severity threats in a single batch",
-                        f"{critical_in_batch}/{len(classified_threats)} threats rated Critical — sustained high-severity activity",
-                    ],
-                    "details": {
-                        "critical_count": critical_in_batch,
-                        "total_batch": len(classified_threats),
-                        "baseline_available": True,
-                    },
-                }
-            )
-
-        # Pattern detection is now handled entirely by ML model (ml_detected_patterns)
-        # Rule-based patterns are deprecated. patterns_detected array is kept empty for backward compatibility.
-        # All detected patterns come from the trained ML model only.
-
-        # ML-based pattern detection (if model available) - runs once per hunt batch
-        if self.pattern_model and self.pattern_scaler and len(classified_threats) >= 2:
-            try:
-                # Get recent threats as sequence
-                recent_threats = [
-                    {
-                        "threat_type": t.get("threat_type"),
-                        "severity": t.get("severity"),
-                        "mitre_tactics": t.get("mitre_tactics", []),
-                        "risk_score": t.get("risk_score", 5.0),
-                        "time_delta": 0,
-                    }
-                    for t in classified_threats[-10:]
-                ]
-
-                if len(recent_threats) >= 2:
-                    features = self._extract_sequence_features(recent_threats)
-                    features_scaled = self.pattern_scaler.transform(features)
-                    is_pattern = self.pattern_model.predict(features_scaled)[0]
-                    pattern_confidence = np.max(
-                        self.pattern_model.predict_proba(features_scaled)
-                    )
-
-                    if is_pattern and pattern_confidence >= 0.65:
-                        # Build detailed description with actual threat data
-                        threat_types = [
-                            t.get("threat_type", "Unknown") for t in recent_threats
-                        ]
-                        threat_types_unique = ", ".join(dict.fromkeys(threat_types))
-
-                        severities = [
-                            t.get("severity", "Unknown") for t in recent_threats
-                        ]
-                        avg_severity = sum(s == "Critical" for s in severities)
-
-                        all_tactics = []
-                        for t in recent_threats:
-                            all_tactics.extend(t.get("mitre_tactics", []))
-                        tactics_str = (
-                            ", ".join(set(all_tactics)[:3])
-                            if all_tactics
-                            else "Unknown"
-                        )
-
-                        avg_risk = (
-                            sum(t.get("risk_score", 0) for t in recent_threats)
-                            / len(recent_threats)
-                            if recent_threats
-                            else 0
-                        )
-
-                        detailed_description = (
-                            f"Coordinated attack sequence ({len(recent_threats)} threats): {threat_types_unique}. "
-                            f"Severity distribution: {', '.join(severities)}. "
-                            f"MITRE tactics: {tactics_str}. "
-                            f"Average risk score: {avg_risk:.1f}/10. "
-                            f"ML confidence: {pattern_confidence:.1%}"
-                        )
-
-                        hunting_results["ml_detected_patterns"].append(
-                            {
-                                "pattern": "Coordinated Attack Sequence",
-                                "description": detailed_description,
-                                "confidence": float(pattern_confidence),
-                            }
-                        )
-                        self.logger.debug(
-                            "  🎯 ML pattern detected with confidence %.2f: %s",
-                            pattern_confidence,
-                            detailed_description,
-                        )
-            except Exception as e:
-                self.logger.error(f"Pattern detection failed: {e}", exc_info=True)
-
-        self.logger.debug(
-            "Hunt complete | Threats: %d | Anomalies: %d | Patterns: %d",
-            len(hunting_results["threats"]),
-            len(hunting_results["anomalies_detected"]),
-            len(hunting_results["ml_detected_patterns"]),
-        )
-
-        return hunting_results
+            return hunting_results
 
     @staticmethod
     def _severity_to_numeric(severity: str) -> float:
@@ -708,11 +787,7 @@ class AnomalyDetector:
         window_size: int = 100,  # How many threats to analyze
         zscore_threshold: float = 2.5,  # How far from normal it is
         min_samples: int = 5,
-    ):  # Baselin
-        # window_size: Number of recent threats to keep for baseline calc
-        # zscore_threshold: Z-score threshold (higher = less sensitive, 2.5 =
-        # top 1.2%)
-        # min_samples: Minimum threats needed before flagging anomalies
+    ):
 
         self.window_size = window_size
         self.zscore_threshold = zscore_threshold
@@ -804,27 +879,10 @@ class AnomalyDetector:
     def detect_anomalies(
         self, severity_score: float, risk_score: float, threat_count_increase: int = 0
     ) -> Dict[str, any]:
-
-        # Detect if a new threat is anomalous
-
-        # Args:
-        # severity_Score: Threat severity (0-10)
-        # risk_score: Threat risk (0-10)
-        # threat_count_increase: How many threats arrived in last time window
-
-        # Returns
-        # {
-        #     "is_anomalous": bool,
-        #     "anomaly_source": float(0-1, higher = more anomalous),
-        #     "reasons": [list of anomaly reasons],
-        #     "details": {detailed metrics}
-        # }
-
+        # Detect if threat is anomalous
         baseline = self.calculate_baseline_stats()
         if baseline is None:
-            # Insufficient baseline — do not emit synthetic anomaly cards.
-            # Real Z-score anomalies will appear once min_samples threats have
-            # been added to threat_history (either via pre-warm or live ingestion).
+            # Insufficient baseline — wait for more samples
             return {
                 "is_anomalous": False,
                 "anomaly_score": 0.0,
@@ -1396,10 +1454,7 @@ if __name__ == "__main__":
 
             hunting_results = agent.hunt_threats(threats_data)
             agent.save_hunting_results_to_database(hunting_results)
-            # Publish each hunted threat to hunting_results channel so Agent 4
-            # receives them even if it started before the initial hunt finished.
-            # Normalise field names to match handle_classified_threat's format
-            # (threat_level, correlated_events, ml_correlated_events + asset info).
+            # Publish hunted threats to channel for Agent 4
             for threat_input, threat_record in zip(
                 threats_data, hunting_results.get("threats", [])
             ):
@@ -1435,9 +1490,7 @@ if __name__ == "__main__":
             session.close()
             agent.logger.info("No classified threats yet. Waiting for Agent 2...")
 
-        # Subscribe AFTER initial hunt and dedup set are fully populated.
-        # This prevents Agent 2's periodic rescan messages from racing with
-        # the initial hunt and causing duplicate processing.
+        # Subscribe after initial hunt completes to prevent duplicates
         agent.start_listening()
         agent.logger.info("Subscribed to 'classified_threats' channel from Agent 2")
 

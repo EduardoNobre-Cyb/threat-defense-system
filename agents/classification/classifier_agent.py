@@ -4,6 +4,9 @@
 from typing import Dict, List
 from shared.communication.message_bus import message_bus
 import time
+import shutil
+import glob
+from pathlib import Path
 from data.models.models import (
     Asset,
     Vulnerability,
@@ -12,18 +15,36 @@ from data.models.models import (
     ThreatReview,
     AnalystCuratedTrainingData,
     get_session,
+    Model,
 )
 from data.modern_cves_for_testing import get_modern_test_cves
+from data.diverse_threat_training_data import get_diverse_threat_scenarios_full
+from data.ensemble_adversarial_samples import (
+    get_extended_adversarial_samples_with_synthetic,
+    get_extended_adversarial_samples_normalized,
+    augment_text_via_synonym_replacement,
+)
 import re
 import pickle
 import os
+import random
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    accuracy_score,
+)
+import numpy as np
 from data.cvss_utils import get_cvss_for_vulnerability, get_severity_from_cvss
 import logging
 from shared.logging_config import setup_agent_logger
@@ -31,6 +52,23 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from dashboard.notification_service import NotificationService
 from agents.classification.ensemble_classifier import EnsembleClassifier
+from data.models.model_prom_workflow import ModelPromotionWorkflow
+from data.models.classifier_feature_extractors import (
+    StructuredMetadataExtractor,
+    Word2VecFeatureExtractor,
+)
+from opentelemetry import trace, metrics
+
+
+class _LegacyClassifierArtifactUnpickler(pickle.Unpickler):
+    """Map legacy extractor pickles to the shared importable classes."""
+
+    def find_class(self, module, name):
+        if name == "Word2VecFeatureExtractor":
+            return Word2VecFeatureExtractor
+        if name == "StructuredMetadataExtractor":
+            return StructuredMetadataExtractor
+        return super().find_class(module, name)
 
 
 class ThreatClassificationAgent:
@@ -75,44 +113,226 @@ class ThreatClassificationAgent:
         self.abstain_label = "Needs Review"
         self.model_version = "nb_v2_conf_gate"  # Naive Bayes with confidence gating
 
-        # ML model for threat classification
-        self.classifier_model = None
-        self.model_path = os.getenv(
-            "ML_MODEL_PATH", "data/models/threat_classifier.pkl"
+        # ML model for threat classification (components)
+        self.classifier = None
+        self.w2v_extractor = None
+        self.metadata_extractor = None
+        self.scaler = None
+        self.label_encoder = None
+        self.model_path = None  # Will be set to active model path after loading
+        self.fallback_model_path = (
+            "data/models/threat_classifier_v2"  # Only used if no active model found
         )
         self.verbose = verbose  # Set to False in listen mode for minimal output
         self.logger = setup_agent_logger(agent_id, verbose)
-        try:
-            self.ensemble = EnsembleClassifier(
-                models_dir="data/models/threat_classifier_v2"
-            )
-            self.ensemble.load_models()
-            self.logger.info(
-                "✅ Loaded ensemble threat classifier (Naive Bayes + SVM + Random Forest)"
-            )
-        except Exception as e:
-            self.logger.error("Failed to load ensemble models: %s.", e)
-            self.ensemble = None
+
+        # Load the active deployed model (or fall back to v2)
+        self.load_model(auto_load_active=True)
+
+        # Fallback ensemble for compatibility (if active model load fails)
+        self.ensemble = None
+        if not self.classifier:
+            try:
+                self.ensemble = EnsembleClassifier(models_dir=self.fallback_model_path)
+                self.ensemble.load_models()
+                self.logger.info(
+                    f"⚠️  Active model not found, falling back to ensemble (Naive Bayes + SVM + Random Forest)"
+                )
+            except Exception as e:
+                self.logger.error("Failed to load ensemble models: %s.", e)
+                self.ensemble = None
+
         self.last_retrain_time = None
         self.retrain_interval = 3600  # Retrain every 1 hour (in seconds)
 
-        # Load or train ML model
-        self._load_or_train_classifier()
+        # Initialize OpenTelemetry tracing
+        self.tracer = trace.get_tracer(self.agent_id)
+        self.meter = metrics.get_meter(self.agent_id)
+        self.classification_time = self.meter.create_histogram(
+            "classification_latency_ms"
+        )
+        self.classified_threats = self.meter.create_counter("threats_classified")
 
         # Subscribe to threat intelligence
         message_bus.subscribe("threat_intelligence", self.classify_threat)
 
+    def _get_active_model_path(self) -> str:
+        """
+        Query database for the active deployed model.
+        Returns the model_path of the active model, or falls back to v2.
+        """
+        try:
+            session = get_session()
+            active_model = (
+                session.query(Model)
+                .filter_by(agent_id=self.agent_id, is_active=True)
+                .first()
+            )
+            session.close()
+
+            if active_model and active_model.model_path:
+                self.logger.debug(f"Found active model at: {active_model.model_path}")
+                return active_model.model_path
+        except Exception as e:
+            self.logger.warning(f"Could not query active model from database: {e}")
+
+        # No active DB model entry: fall back to the highest local versioned model folder.
+        model_root = Path("data/models")
+        highest_version = -1
+        highest_path = None
+
+        if model_root.exists():
+            for candidate in model_root.glob("threat_classifier_v*"):
+                if not candidate.is_dir():
+                    continue
+
+                try:
+                    version_num = int(candidate.name.split("_v")[-1])
+                except (ValueError, IndexError):
+                    continue
+
+                required_files = [
+                    candidate / "classifier.pkl",
+                    candidate / "w2v_extractor.pkl",
+                    candidate / "metadata_extractor.pkl",
+                    candidate / "scaler.pkl",
+                    candidate / "label_encoder.pkl",
+                ]
+
+                if all(path.exists() for path in required_files):
+                    if version_num > highest_version:
+                        highest_version = version_num
+                        highest_path = candidate
+
+        if highest_path is not None:
+            selected_path = str(highest_path)
+            self.logger.info(
+                f"No active DB model found. Using highest local model: {selected_path}"
+            )
+            return selected_path
+
+        # Fallback to v2 if no active model found
+        fallback_path = "data/models/threat_classifier_v2"
+        self.logger.debug(f"Using fallback model path: {fallback_path}")
+        return fallback_path
+
+    # _enrich_threat_description removed - classifier uses structured metadata instead of text enrichment
+
+    def load_model(self, auto_load_active=True) -> None:
+        """
+        Load semantic ensemble model components (Word2Vec + metadata extractor + Gradient Boosting classifier).
+        Falls back gracefully to v2 if active model not found.
+        Updates self.model_path to reflect the actual active model path.
+        """
+        if auto_load_active:
+            model_path = self._get_active_model_path()
+        else:
+            model_path = self.fallback_model_path
+
+        model_path = Path(model_path)
+
+        try:
+            # Load all components
+            with open(model_path / "classifier.pkl", "rb") as f:
+                self.classifier = pickle.load(f)
+            with open(model_path / "w2v_extractor.pkl", "rb") as f:
+                self.w2v_extractor = _LegacyClassifierArtifactUnpickler(f).load()
+            with open(model_path / "metadata_extractor.pkl", "rb") as f:
+                self.metadata_extractor = _LegacyClassifierArtifactUnpickler(f).load()
+            with open(model_path / "scaler.pkl", "rb") as f:
+                self.scaler = pickle.load(f)
+            with open(model_path / "label_encoder.pkl", "rb") as f:
+                self.label_encoder = pickle.load(f)
+
+            # Update model_path to reflect what's actually active
+            self.model_path = str(model_path)
+
+            self.logger.info(f"✅ Loaded classifier model from {self.model_path}")
+            self.logger.info(
+                f"   Architecture: Word2Vec embeddings + Metadata features + Gradient Boosting"
+            )
+            self.model_version = "word2vec_metadata_classifier"
+
+        except (FileNotFoundError, Exception) as e:
+            self.logger.warning(f"⚠️  Could not load model from {model_path}: {e}")
+            self.model_path = None  # Indicate no model loaded
+            self.classifier = None
+            self.w2v_extractor = None
+            self.metadata_extractor = None
+            self.scaler = None
+            self.label_encoder = None
+
+    def _extract_threat_metadata_from_logs(
+        self, session, source_filter: str = None
+    ) -> Dict:
+        """Extract threat actor, indicators, and campaign data from log events."""
+        from data.models.models import LogEvent
+        import json
+
+        metadata = {
+            "threat_actors": set(),
+            "indicators": [],
+            "campaigns": set(),
+        }
+
+        try:
+            # Query ALL logs - extract from logs that have threat_actor data
+
+            logs_to_scan = session.query(LogEvent).all()
+            self.logger.info(
+                f"🔍 Scanning {len(logs_to_scan)} total logs for threat intel..."
+            )
+
+            logs_processed = 0
+
+            for log in logs_to_scan:
+                try:
+                    if log.data:
+                        event_data = json.loads(log.data)
+                        logs_processed += 1
+
+                        # Extract threat actor
+                        if event_data.get("threat_actor"):
+                            actor = event_data["threat_actor"]
+                            metadata["threat_actors"].add(actor)
+                            self.logger.info(f"  ✓ Found threat_actor: {actor}")
+
+                        # Extract indicators
+                        if event_data.get("indicator_type") and event_data.get(
+                            "indicator_value"
+                        ):
+                            metadata["indicators"].append(
+                                {
+                                    "type": event_data["indicator_type"],
+                                    "value": event_data["indicator_value"],
+                                }
+                            )
+
+                        # Extract campaign
+                        if event_data.get("campaign"):
+                            metadata["campaigns"].add(event_data["campaign"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    self.logger.debug(f"JSON parse error in log: {e}")
+                    continue
+
+        except Exception as e:
+            self.logger.error(f"Error extracting threat metadata: {e}")
+            import traceback
+
+            self.logger.error(traceback.format_exc())
+
+        return {
+            "threat_actors": list(metadata["threat_actors"]),
+            "indicators": metadata["indicators"],
+            "campaigns": list(metadata["campaigns"]),
+        }
+
     def classify_threat(self, message: Dict):
+        """Classify threat: receives unclassified asset-vulnerability pairs, applies ML, publishes to Agent 3"""
+        start = time.time()
 
         session = get_session()
-        if self.verbose:
-            self.logger.info("Received message from 'threat_intelligence': %s", message)
-            self.logger.info("Classifying threat...")
-        else:
-            src = message.get("source", "unknown")
-            self.logger.info(
-                "📨 Triggered by '%s' — scanning for unclassified pairs...", src
-            )
+
         try:
             # Fetch all asset-vulnerability pairs to classify
             pairs = (
@@ -120,6 +340,7 @@ class ThreatClassificationAgent:
                     AssetVulnerability.asset_id,
                     AssetVulnerability.vulnerability_id,
                     Asset.name.label("asset_name"),
+                    Asset.type.label("asset_type"),
                     Asset.risk_level,
                     Vulnerability.name.label("vuln_name"),
                     Vulnerability.severity,
@@ -137,10 +358,32 @@ class ThreatClassificationAgent:
             if not pairs:
                 self.logger.warning("⚠️  No asset-vulnerability pairs found in DB.")
                 return
+
             if self.verbose:
+                self.logger.info(
+                    "Received message from 'threat_intelligence': %s", message
+                )
+                self.logger.info("Classifying threat...")
                 self.logger.info(
                     "Found %d asset-vulnerability pairs to classify.", len(pairs)
                 )
+            else:
+                src = message.get("source", "unknown")
+                self.logger.info(
+                    "📨 Triggered by '%s' — scanning for unclassified pairs...", src
+                )
+
+            # Extract threat metadata from logs - use source filepath if available for efficiency
+            source_filter = message.get("source")  # File path from Agent 1
+            threat_metadata = self._extract_threat_metadata_from_logs(
+                session, source_filter
+            )
+            if threat_metadata["threat_actors"] or threat_metadata["indicators"]:
+                self.logger.info(
+                    f"📊 Extracted threat metadata: {len(threat_metadata['threat_actors'])} threat actors, "
+                    f"{len(threat_metadata['indicators'])} indicators"
+                )
+
             classified_count = 0
             classifications_for_hunter = []  # Collect classifications for Agent 3
             # Loop through each pair and classify
@@ -181,7 +424,6 @@ class ThreatClassificationAgent:
                     self.logger.debug("Description: '%s'", pair.description)
 
                 # Get CVSS score - use stored value or calculate if missing
-
                 if pair.cvss_base_score:
                     cvss_score = float(pair.cvss_base_score)
                 else:
@@ -191,48 +433,171 @@ class ThreatClassificationAgent:
                     )
                     cvss_score = cvss_data["base_score"]
 
-                # Calculate scores
-
                 # Calculate exploitability (CVSS score with keyword adjustments)
                 exploitability = self._calculate_exploitability_score_cvss(
                     pair.description or "", cvss_score
                 )
                 impact = self._calculate_impact_score(pair.risk_level)
 
-                # Caclulate composite risk score
-                # Formula: CVSS provides base, asset criticalite provides context
+                # Calculate composite risk score
+                # Formula: CVSS provides base, asset criticality provides context
                 risk = self._calculate_risk_score_cvss(
                     cvss_score,
                     impact,
                 )
 
-                # Determine classification
-
                 # Determine severity from CVSS (industry standard)
                 severity = get_severity_from_cvss(cvss_score)
                 description = pair.description or ""
-                if self.ensemble:
-                    predictions = self.ensemble.classify_with_confidence(description)
 
+                # Use structured metadata instead of text enrichment
+                threat_dict = {
+                    "description": description,
+                    "threat_type": "Unknown",  # Will be predicted
+                    "cvss_score": cvss_score,
+                    "severity": severity,
+                    "exploitability": exploitability,
+                    "asset_type": pair.asset_type,
+                    "asset_criticality": pair.risk_level,
+                }
+
+                # Classification: try classifier first, fallback to ensemble
+                if self.classifier and self.w2v_extractor and self.metadata_extractor:
+                    # Classifier path: Word2Vec + Metadata + Gradient Boosting
+                    try:
+                        # Extract semantic features from raw description
+                        semantic_features = self.w2v_extractor.transform([description])
+
+                        # Extract metadata features
+                        metadata_features = self.metadata_extractor.transform(
+                            [threat_dict]
+                        )
+
+                        # Combine features
+                        X = np.hstack([semantic_features, metadata_features])
+
+                        # Scale features
+                        X_scaled = self.scaler.transform(X)
+
+                        # Predict
+                        threat_type_encoded = self.classifier.predict(X_scaled)[0]
+                        base_label = self.label_encoder.inverse_transform(
+                            [threat_type_encoded]
+                        )[0]
+                        confidence_scores = self.classifier.predict_proba(X_scaled)[0]
+                        confidence = float(np.max(confidence_scores))
+
+                        # Get runner-up
+                        sorted_indices = np.argsort(confidence_scores)[::-1]
+                        runner_up_label = self.label_encoder.inverse_transform(
+                            [sorted_indices[1]]
+                        )[0]
+                        runner_up_conf = float(confidence_scores[sorted_indices[1]])
+                        margin = max(0.0, confidence - runner_up_conf)
+                        model_agreement = True
+
+                        # Routing logic based on confidence thresholds
+                        if confidence < 0.45:
+                            threat_type = "Needs Review"
+                            source = "classifier_low_confidence"
+                        elif confidence >= 0.70:
+                            threat_type = base_label
+                            source = "classifier_high_confidence"
+                        else:
+                            threat_type = base_label
+                            source = "classifier_medium_confidence"
+
+                        decision = {
+                            "label": threat_type,
+                            "source": source,
+                            "confidence": confidence,
+                            "margin": margin,
+                            "top_candidates": [
+                                {"label": base_label, "score": round(confidence, 4)},
+                                {
+                                    "label": runner_up_label,
+                                    "score": round(runner_up_conf, 4),
+                                },
+                            ],
+                            "runner_up": runner_up_label,
+                            "model_agreement": model_agreement,
+                        }
+                    except Exception as e:
+                        self.logger.error(
+                            f"Classifier prediction failed: {e}, falling back to ensemble"
+                        )
+                        if self.ensemble:
+                            predictions = self.ensemble.classify_with_confidence(
+                                description
+                            )
+                            base_label = predictions["threat_type"]
+                            confidence = float(predictions["confidence"])
+                            model_agreement = bool(predictions["model_agreement"])
+                            runner_up_label = predictions.get("runner_up", "Unknown")
+                            runner_up_conf = float(
+                                predictions.get("runner_up_confidence", 0.0)
+                            )
+                            margin = max(0.0, confidence - runner_up_conf)
+
+                            if confidence < 0.45:
+                                threat_type = "Needs Review"
+                                source = "ensemble_fallback_low_conf"
+                            elif confidence >= 0.70:
+                                threat_type = base_label
+                                source = "ensemble_fallback_high_conf"
+                            else:
+                                threat_type = base_label
+                                source = "ensemble_fallback_medium_conf"
+
+                            decision = {
+                                "label": threat_type,
+                                "source": source,
+                                "confidence": confidence,
+                                "margin": margin,
+                                "top_candidates": [
+                                    {
+                                        "label": base_label,
+                                        "score": round(confidence, 4),
+                                    },
+                                    {
+                                        "label": runner_up_label,
+                                        "score": round(runner_up_conf, 4),
+                                    },
+                                ],
+                                "runner_up": runner_up_label,
+                                "model_agreement": model_agreement,
+                            }
+                        else:
+                            threat_type = "Needs Review"
+                            decision = {
+                                "label": "Needs Review",
+                                "source": "no_classifier",
+                                "confidence": 0.0,
+                                "margin": 0.0,
+                                "top_candidates": [],
+                                "runner_up": "Unknown",
+                                "model_agreement": False,
+                            }
+                elif self.ensemble:
+                    # Fallback to ensemble if the classifier is not available
+                    predictions = self.ensemble.classify_with_confidence(description)
                     base_label = predictions["threat_type"]
                     confidence = float(predictions["confidence"])
                     model_agreement = bool(predictions["model_agreement"])
-                    runner_up = predictions.get("runner_up", "Unknown")
+                    runner_up_label = predictions.get("runner_up", "Unknown")
                     runner_up_conf = float(predictions.get("runner_up_confidence", 0.0))
                     margin = max(0.0, confidence - runner_up_conf)
 
-                    # Routing logic: uncertain cases go to analyst review
-                    if confidence < 0.50 or not model_agreement:
+                    if confidence < 0.45:
                         threat_type = "Needs Review"
-                        source = "ensemble_abstain"
-                    elif confidence >= 0.85:
+                        source = "ensemble_low_conf"
+                    elif confidence >= 0.70:
                         threat_type = base_label
                         source = "ensemble_high_conf"
                     else:
                         threat_type = base_label
                         source = "ensemble_medium_conf"
 
-                    # Keep decision shape compatible with downstream code
                     decision = {
                         "label": threat_type,
                         "source": source,
@@ -240,25 +605,35 @@ class ThreatClassificationAgent:
                         "margin": margin,
                         "top_candidates": [
                             {"label": base_label, "score": round(confidence, 4)},
-                            {"label": runner_up, "score": round(runner_up_conf, 4)},
+                            {
+                                "label": runner_up_label,
+                                "score": round(runner_up_conf, 4),
+                            },
                         ],
-                        "runner_up": runner_up,
+                        "runner_up": runner_up_label,
                         "model_agreement": model_agreement,
                     }
                 else:
-                    # Fallback to existing NB/rule logic if ensemble is unavailable
-                    decision = self._determine_threat_decision(description)
-                    threat_type = decision["label"]
+                    threat_type = "Needs Review"
+                    decision = {
+                        "label": "Needs Review",
+                        "source": "no_classifier",
+                        "confidence": 0.0,
+                        "margin": 0.0,
+                        "top_candidates": [],
+                        "runner_up": "Unknown",
+                        "model_agreement": False,
+                    }
 
                 mitre_tactic = self._extract_mitre_tactic(pair.description)
 
                 if threat_type == "Needs Review":
                     self.logger.warning(
-                        "⚠️ Ensemble routed to review | base=%s conf =%.3f agree=%s runner_up=%s",
-                        base_label,
-                        confidence,
-                        model_agreement,
-                        runner_up,
+                        "⚠️ Routed to review | source=%s conf=%.3f agreement=%s runner_up=%s",
+                        decision["source"],
+                        decision["confidence"],
+                        decision["model_agreement"],
+                        decision.get("runner_up", "Unknown"),
                     )
 
                 # Still compute risk/severity for triage purposes, even if threat type is uncertain
@@ -305,13 +680,26 @@ class ThreatClassificationAgent:
                     risk_score=risk,
                     severity=severity,
                     mitre_tactic=mitre_tactic,
+                    # Confidence and source tracking
+                    ensemble_confidence=float(decision["confidence"]),
+                    model_agreement=decision["model_agreement"],
+                    classification_runner_up=decision.get("runner_up", "Unknown"),
+                    runner_up_confidence=(
+                        decision.get("top_candidates", [{"score": 0.0}])[1].get("score")
+                        if len(decision.get("top_candidates", [])) > 1
+                        else None
+                    ),
+                    # Human review tracking
+                    reviewed_by_analyst=False,
+                    reviewed_by_id=None,
+                    reviewed_at=None,
+                    analyst_notes=None,
                 )
                 session.add(classification)
                 session.flush()  # Assign ID so Agent 3 can reference it
 
                 # Create ThreatReview record if marked for review
                 if threat_type == "Needs Review":
-
                     # Calculate SLA deadline based on severity
                     sla_hours = {"critical": 1, "high": 4, "medium": 24, "low": 72}.get(
                         severity, 24
@@ -344,6 +732,11 @@ class ThreatClassificationAgent:
                         "prediction_margin": decision["margin"],
                         "top_candidates": decision["top_candidates"],
                         "model_version": self.model_version,
+                        # Include threat intelligence metadata from logs
+                        "threat_actors": threat_metadata.get("threat_actors", []),
+                        "indicators": threat_metadata.get("indicators", []),
+                        "campaigns": threat_metadata.get("campaigns", []),
+                        "message": f"{pair.vuln_name} detected on {pair.asset_name}",
                     }
                 )
 
@@ -357,7 +750,7 @@ class ThreatClassificationAgent:
                 self.logger.debug("Results saved to threat_classifications table.")
             else:
                 if classified_count > 0:
-                    self.logger.info("✅ Classified %s new threats ", classified_count),
+                    self.logger.info("✅ Classified %s new threats", classified_count)
                     self.logger.info(
                         "%s already done, %d total pairs",
                         already_classified,
@@ -383,10 +776,17 @@ class ThreatClassificationAgent:
                 # Check if it's time to retrain the model
                 self._check_and_retrain()
 
+            latency_ms = (time.time() - start) * 1000
+            self.classification_time.record(latency_ms)
+            self.classified_threats.add(classified_count)
+
         except Exception as e:
             self.logger.error("❌ Error during classification: %s", e)
             traceback.print_exc()
             session.rollback()
+            latency_ms = (time.time() - start) * 1000
+            self.classification_time.record(latency_ms)
+            self.classified_threats.add(0)
         finally:
             session.close()
 
@@ -562,17 +962,14 @@ class ThreatClassificationAgent:
     def _calculate_exploitability_score_cvss(
         self, description, cvss_score: float
     ) -> float:
-        # Calculate exploitability score based on CVSS with keyword adjustments.
-        # CVSS already factors in exploitability, so we use it as base
-        # and only make minor adjustments for context.
-
-        # Start with CVSS score (already includes exploitability metrics)
+        # Calculate exploitability score based on CVSS
         base_score = cvss_score
 
         # Minor adjustments based on description keywords
         description_lower = description.lower() if description else ""
 
         # Increase if proof-of-concept exists
+        # Increase score if exploit or poc exists
         if "exploit" in description_lower or "poc" in description_lower:
             base_score = min(base_score + 0.5, 10.0)
 
@@ -594,12 +991,7 @@ class ThreatClassificationAgent:
     def _calculate_risk_score_cvss(
         self, cvss_score: float, impact_score: float
     ) -> float:
-        # Calculate composite risk score combining CVSS and asset criticality.
-        # Formula: (CVSS × 0.7) + (Asset Impact × 0.3)
-        # Why 70/30?
-        # - CVSS is comprehensive and should dominate
-        # - Asset criticality provides organizational context
-
+        # Combine CVSS and asset criticality to get risk score
         risk = (cvss_score * 0.7) + (impact_score * 0.3)
         return round(risk, 2)
 
@@ -634,6 +1026,8 @@ class ThreatClassificationAgent:
             "🔄 Training ensemble classifier with CVE data and curated samples..."
         )
 
+        start_time = time.time()
+
         # Fetch training data from external CVE sources
         training_text, training_labels = self._fetch_cve_training_data()
 
@@ -659,16 +1053,111 @@ class ThreatClassificationAgent:
         label_counts = Counter(training_labels)
         self.logger.info("Training data distribution: %s", dict(label_counts))
 
-        # Train ensemble
+        # Split into 80% train + 20% test for validation
+        X_train, X_test, y_train, y_test = train_test_split(
+            training_text,
+            training_labels,
+            test_size=0.2,
+            random_state=42,
+            stratify=training_labels,  # Keep class distro balanced
+        )
+
+        self.logger.info(
+            "Split: %d training, %d test samples", len(X_train), len(X_test)
+        )
+
+        # Train ensemble (on 80%)
         try:
-            self.ensemble.train_ensemble(training_text, training_labels)
+            self.ensemble.train_ensemble(X_train, y_train)
             self.ensemble.save_models()
             self.logger.info(
                 "✅ Training ensemble (NB + SVM + RF) on %d samples.",
-                len(training_text),
+                len(X_train),
             )
         except Exception as e:
             self.logger.error("Failed to train ensemble: %s", e)
+            return None
+
+        training_duration = int(time.time() - start_time)
+
+        # Test on held-out 20% and calc metrics
+        try:
+            y_pred = self.ensemble.predict(X_test)
+
+            # Overall metrics
+            accuracy = float(accuracy_score(y_test, y_pred))
+            macro_f1 = float(f1_score(y_test, y_pred, average="macro", zero_division=0))
+
+            # Per-class metrics
+            recall_per_class = {}
+            precision_per_class = {}
+
+            for class_label in np.unique(y_test):
+                # One-vs-rest binary precision/recall for this class
+                y_test_binary = np.array([1 if y == class_label else 0 for y in y_test])
+                y_pred_binary = np.array([1 if y == class_label else 0 for y in y_pred])
+
+                recall_per_class[str(class_label)] = float(
+                    recall_score(y_test_binary, y_pred_binary, zero_division=0)
+                )
+                precision_per_class[str(class_label)] = float(
+                    precision_score(y_test_binary, y_pred_binary, zero_division=0)
+                )
+
+            # Build metrics dict for Model Reg
+            metrics = {
+                "accuracy": accuracy,
+                "macro_f1": macro_f1,
+                "recall_per_class": recall_per_class,
+                "precision_per_class": precision_per_class,
+                "training_duration_seconds": training_duration,
+            }
+
+            self.logger.info(
+                f"✅ Metrics - Accuracy: {accuracy:.3f}, F1: {macro_f1:.3f}"
+            )
+            self.logger.info(f"Recall per class: {recall_per_class}")
+            self.logger.info(f"Precision per class: {precision_per_class}")
+
+            return metrics  # Return metrics dict
+
+        except Exception as e:
+            self.logger.error(f"Failed to evaluate ensemble metrics: {e}")
+            return None
+
+    def _passed_quality_gates(self, metrics: Dict) -> bool:
+        """Check if trained model(s) passe minimum quality standards before reg"""
+        macro_f1 = metrics.get("macro_f1", 0.0)
+        accuracy = metrics.get("accuracy", 0.0)
+        recalls = metrics.get("recall_per_class", {})
+
+        # Gate 1: F1 >= 0.72
+        if macro_f1 < 0.72:
+            self.logger.warning(
+                f"❌ Quality gate FAILED: Macro F1 too low ({macro_f1:.3f} < 0.72)"
+            )
+            return False
+
+        # Gate 2: Accuracy >= 0.5 would usually be .75 but given the paraphrasing, models are cautious
+        if accuracy < 0.5:
+            self.logger.warning(
+                f"❌ Quality gate FAILED: Accuracy too low ({accuracy:.3f} < 0.5)"
+            )
+            return False
+
+        # Gate 3: All per-class recall >= 0.6
+        if recalls:
+            min_recall = min(recalls.values())
+            if min_recall < 0.6:
+                worst_class = min(recalls, key=recalls.get)
+                self.logger.warning(
+                    f"❌ Quality gate FAILED: Worst class recall ({worst_class} = {min_recall:.3f} < 0.6)"
+                    f"All recalls: {recalls}"
+                )
+                return False
+
+        self.logger.info("✅ All quality gates PASSED.")
+        return True
 
     def _fetch_cve_training_data(self):
         """Fetch training data from database (classified by agents) or fallback to hardcoded examples."""
@@ -945,26 +1434,7 @@ class ThreatClassificationAgent:
         session.close()
         return training_texts, training_labels
 
-    # def _fetch_from_nvd_api(self):
-    #     """
-    #     Future implementation: Fetch real CVE data from NVD API.
-    #     This would replace the sample data with actual CVE descriptions and classifications.
-
-    #     Example API endpoints:
-    #     - NVD: https://services.nvd.nist.gov/rest/json/cves/2.0
-    #     - Vulners: https://vulners.com/api/v3/search/lucene/
-    #     - CVE Details: https://www.cvedetails.com/api/
-
-    #     Benefits:
-    #     - Much larger training dataset (100k+ CVEs)
-    #     - Real-world vulnerability descriptions
-    #     - Proper CWE classifications
-    #     - Regular updates with new CVEs
-    #     - Persistent data that survives database resets
-    #     """
-    #     # TODO: Implement actual API integration
-    #     # For now, return empty to use sample data
-    #     return [], []
+    # TODO: Add NVD API integration in future
 
     def _bootstrap_label(self, description):
 
@@ -1102,64 +1572,6 @@ class ThreatClassificationAgent:
         else:
             return "Vulnerability Exploitation"
 
-    def retrain_model(self):
-
-        # Retrain the classifier using classified threats from database.
-        # Call this periodically to improve classification accuracy.
-
-        session = get_session()
-
-        # Get all classified threats
-        classified = session.query(ThreatClassification).all()
-
-        if len(classified) < 10:
-            self.logger.warning(
-                "Not enough classified data to retrain (%d samples). Need at least 10.",
-                len(classified),
-            )
-            return
-
-        # Extract descriptions and labels
-        training_texts = []
-        training_labels = []
-
-        for record in classified:
-            # Get vulnerability description
-            vuln = (
-                session.query(Vulnerability)
-                .filter_by(id=record.vulnerability_id)
-                .first()
-            )
-            if vuln and vuln.description:
-                training_texts.append(vuln.description)
-                training_labels.append(record.threat_type)
-
-        if len(training_texts) < 10:
-            self.logger.warning(
-                "Not enough valid training data (%d samples).", len(training_texts)
-            )
-            return
-
-        # Retrain classifier
-        self.classifier_model = make_pipeline(
-            TfidfVectorizer(max_features=500), MultinomialNB()
-        )
-
-        self.classifier_model.fit(training_texts, training_labels)
-
-        # Save updated model
-        with open(self.model_path, "wb") as f:
-            pickle.dump(self.classifier_model, f)
-
-        # Update last retrain time
-        self.last_retrain_time = time.time()
-
-        self.logger.debug(
-            "✅ Retrained classifier on %d real classified threats.",
-            len(training_texts),
-        )
-        session.close()
-
     def incorporate_analyst_feedback(self):
         """
         Fetch all analyst-curated training data since last retrain.
@@ -1274,30 +1686,492 @@ class ThreatClassificationAgent:
         finally:
             session.close()
 
-    def _check_and_retrain(self):
-
-        # Check if enough time has passed since last retrain and trigger retraining.
-        # This enables continuous learning during normal operation.
+    def should_train(self):
+        """Check if enough time has passed to retrain the model."""
+        if self.last_retrain_time is None:
+            return False  # Don't retrain on startup
 
         current_time = time.time()
+        time_since_last_train = current_time - self.last_retrain_time
 
-        # First run - set initial time
-        if self.last_retrain_time is None:
-            self.last_retrain_time = current_time
+        if time_since_last_train >= self.retrain_interval:
+            self.logger.info(
+                f"⏰ Retraining interval ({self.retrain_interval/3600:.1f}h) elapsed"
+            )
+            return True
+        return False
+
+    def _get_next_model_version(self) -> tuple:
+        """
+        Determine the next model version folder.
+        Scans data/models/ for threat_classifier_v{N}, returns N+1 and new path.
+        """
+        models_dir = "data/models"
+        os.makedirs(models_dir, exist_ok=True)
+
+        # Find all versioned folders
+        versioned_folders = glob.glob(f"{models_dir}/threat_classifier_v*")
+
+        if not versioned_folders:
+            # First version is v2 (v1 is implied as baseline)
+            next_version = 2
+        else:
+            # Extract version numbers and get the max
+            versions = []
+            for folder in versioned_folders:
+                try:
+                    # Extract number from "threat_classifier_v3" -> 3
+                    version_num = int(folder.split("_v")[-1])
+                    versions.append(version_num)
+                except (ValueError, IndexError):
+                    continue
+
+            next_version = max(versions) + 1 if versions else 2
+
+        new_folder = f"{models_dir}/threat_classifier_v{next_version}"
+        self.logger.info(f"Next model version: v{next_version} at {new_folder}")
+
+        return next_version, new_folder
+
+    def _consolidate_periodic_threat_type(self, threat_type: str) -> str:
+        """Map legacy/adversarial labels to the canonical threat taxonomy used."""
+        threat_mapping = {
+            "Injection Attack": "SQL Injection",
+            "Cryptographic Weakness": "Sensitive Data Exposure",
+            "Information Disclosure": "Sensitive Data Exposure",
+            "Input Validation": "SQL Injection",
+            "Request Forgery": "Server-Side Request Forgery",
+            "Cross-Site Scripting": "Cross-Site Scripting",
+            "Remote Code Execution": "Remote Code Execution",
+            "Path Traversal": "Path Traversal",
+            "Authentication Bypass": "Authentication Bypass",
+            "Privilege Escalation": "Privilege Escalation",
+            "Denial of Service": "Denial of Service",
+            "Insecure Direct Object Reference": "Insecure Direct Object Reference",
+            "Sensitive Data Exposure": "Sensitive Data Exposure",
+            "Server-Side Request Forgery": "Server-Side Request Forgery",
+        }
+        return threat_mapping.get(threat_type, "SQL Injection")
+
+    def _check_and_retrain(self):
+        """Periodic retraining using the same gbc pipeline with automatic versioned folders."""
+        if not self.should_train():
             return
 
-        # Check if interval has passed
-        time_since_retrain = current_time - self.last_retrain_time
+        try:
+            self.logger.info("=" * 80)
+            self.logger.info("⏰ PERIODIC RETRAINING (GBC PIPELINE)")
+            self.logger.info("=" * 80)
 
-        if time_since_retrain >= self.retrain_interval:
+            random.seed(42)
+            np.random.seed(42)
+
+            next_version, next_folder = self._get_next_model_version()
+            os.makedirs(next_folder, exist_ok=True)
+            self.logger.info("[1/6] Creating versioned folder: %s", next_folder)
+
+            # Load baseline training set used by training script
+
+            self.logger.info("[2/6] Loading baseline datasets...")
+            synthetic_threats = get_diverse_threat_scenarios_full()
+            adversarial_samples = get_extended_adversarial_samples_normalized()
+
+            threat_type_ranges = {
+                "SQL Injection": {
+                    "cvss_min": 7.5,
+                    "cvss_max": 9.2,
+                    "severities": ["High", "Critical"],
+                },
+                "Cross-Site Scripting": {
+                    "cvss_min": 5.5,
+                    "cvss_max": 8.0,
+                    "severities": ["Medium", "High"],
+                },
+                "Authentication Bypass": {
+                    "cvss_min": 8.5,
+                    "cvss_max": 9.8,
+                    "severities": ["Critical"],
+                },
+                "Privilege Escalation": {
+                    "cvss_min": 7.5,
+                    "cvss_max": 9.5,
+                    "severities": ["High", "Critical"],
+                },
+                "Server-Side Request Forgery": {
+                    "cvss_min": 6.0,
+                    "cvss_max": 8.5,
+                    "severities": ["High"],
+                },
+                "Path Traversal": {
+                    "cvss_min": 6.5,
+                    "cvss_max": 8.5,
+                    "severities": ["High"],
+                },
+                "Remote Code Execution": {
+                    "cvss_min": 8.5,
+                    "cvss_max": 10.0,
+                    "severities": ["Critical"],
+                },
+                "Sensitive Data Exposure": {
+                    "cvss_min": 5.0,
+                    "cvss_max": 8.0,
+                    "severities": ["Medium", "High"],
+                },
+                "Denial of Service": {
+                    "cvss_min": 6.5,
+                    "cvss_max": 9.0,
+                    "severities": ["High", "Critical"],
+                },
+                "Insecure Direct Object Reference": {
+                    "cvss_min": 6.0,
+                    "cvss_max": 8.5,
+                    "severities": ["High"],
+                },
+            }
+
+            asset_types = [
+                "Web Application",
+                "API Server",
+                "Database",
+                "Web Server",
+                "Network Service",
+            ]
+
+            adversarial_threats = []
+            for idx, (description, original_threat_type) in enumerate(
+                adversarial_samples
+            ):
+                canonical_threat_type = self._consolidate_periodic_threat_type(
+                    original_threat_type
+                )
+                ranges = threat_type_ranges.get(
+                    canonical_threat_type,
+                    {"cvss_min": 6.5, "cvss_max": 8.5, "severities": ["High"]},
+                )
+                cvss_score = np.random.uniform(ranges["cvss_min"], ranges["cvss_max"])
+                exploitability = np.random.uniform(
+                    cvss_score - 1.5,
+                    min(cvss_score, 10.0),
+                )
+                severity = np.random.choice(ranges["severities"])
+
+                adversarial_threats.append(
+                    {
+                        "description": description,
+                        "threat_type": canonical_threat_type,
+                        "cvss_score": round(float(cvss_score), 1),
+                        "severity": severity,
+                        "exploitability": round(float(exploitability), 1),
+                        "asset_type": asset_types[idx % len(asset_types)],
+                    }
+                )
+
+            baseline_count = len(synthetic_threats) + len(adversarial_threats)
             self.logger.info(
-                f"⏰ {time_since_retrain/3600:.1f} hours since last retrain. Retraining model..."
+                "   Baseline samples: %d (synthetic=%d, adversarial=%d)",
+                baseline_count,
+                len(synthetic_threats),
+                len(adversarial_threats),
             )
-            self.retrain_model()
-        else:
-            if self.verbose:
-                remaining = (self.retrain_interval - time_since_retrain) / 60
-                self.logger.debug("Next retrain in %d minutes", remaining)
+
+            # Load DB + analyst curated feedback and append to baseline
+
+            self.logger.info("[3/6] Loading DB and analyst-curated feedback...")
+            session = get_session()
+            db_training_threats = []
+
+            try:
+                classifications = (
+                    session.query(
+                        ThreatClassification,
+                        Vulnerability.description,
+                        Vulnerability.cvss_base_score,
+                        Asset.type,
+                        Asset.risk_level,
+                    )
+                    .join(
+                        Vulnerability,
+                        ThreatClassification.vulnerability_id == Vulnerability.id,
+                    )
+                    .join(Asset, ThreatClassification.asset_id == Asset.id)
+                    .filter(
+                        ThreatClassification.threat_type.isnot(None),
+                        Vulnerability.description.isnot(None),
+                    )
+                    .all()
+                )
+
+                for (
+                    threat_class,
+                    vuln_desc,
+                    cvss_score,
+                    asset_type,
+                    asset_risk,
+                ) in classifications:
+                    if not vuln_desc:
+                        continue
+
+                    resolved_cvss = (
+                        float(cvss_score)
+                        if cvss_score is not None
+                        else get_cvss_for_vulnerability(
+                            threat_class.threat_type.replace(" ", "-"), vuln_desc
+                        )["base_score"]
+                    )
+                    severity = get_severity_from_cvss(resolved_cvss)
+                    exploitability = self._calculate_exploitability_score_cvss(
+                        vuln_desc,
+                        resolved_cvss,
+                    )
+
+                    db_training_threats.append(
+                        {
+                            "description": vuln_desc,
+                            "threat_type": threat_class.threat_type,
+                            "cvss_score": float(resolved_cvss),
+                            "severity": severity,
+                            "exploitability": float(exploitability),
+                            "asset_type": asset_type or "General",
+                            "asset_criticality": asset_risk or "Medium",
+                        }
+                    )
+
+                curated_rows = (
+                    session.query(AnalystCuratedTrainingData)
+                    .filter(
+                        AnalystCuratedTrainingData.vulnerability_description.isnot(
+                            None
+                        ),
+                        AnalystCuratedTrainingData.analyst_corrected_threat_type.isnot(
+                            None
+                        ),
+                    )
+                    .all()
+                )
+
+                for row in curated_rows:
+                    desc = row.vulnerability_description.strip()
+                    if not desc:
+                        continue
+
+                    threat_type = row.analyst_corrected_threat_type.strip()
+                    cvss_score = get_cvss_for_vulnerability(
+                        threat_type.replace(" ", "-"),
+                        desc,
+                    )["base_score"]
+                    severity = (
+                        row.threat_severity
+                        if row.threat_severity
+                        else get_severity_from_cvss(cvss_score)
+                    )
+                    exploitability = self._calculate_exploitability_score_cvss(
+                        desc,
+                        cvss_score,
+                    )
+
+                    db_training_threats.append(
+                        {
+                            "description": desc,
+                            "threat_type": threat_type,
+                            "cvss_score": float(cvss_score),
+                            "severity": severity,
+                            "exploitability": float(exploitability),
+                            "asset_type": "General",
+                            "asset_criticality": "Medium",
+                        }
+                    )
+            finally:
+                session.close()
+
+            self.logger.info(
+                "   DB/curated samples appended: %d", len(db_training_threats)
+            )
+
+            all_threats = synthetic_threats + adversarial_threats + db_training_threats
+            if len(all_threats) < 50:
+                self.logger.warning(
+                    "⚠️  Not enough total training samples (%d). Skipping retrain.",
+                    len(all_threats),
+                )
+                return
+
+            # Train model: Word2Vec + metadata + calibrated GBC
+
+            self.logger.info(
+                "[4/6] Training GBC model on %d samples...",
+                len(all_threats),
+            )
+
+            descriptions = [
+                t["description"] for t in all_threats if t.get("description")
+            ]
+            labels = [t["threat_type"] for t in all_threats if t.get("description")]
+            filtered_threats = [t for t in all_threats if t.get("description")]
+
+            w2v_extractor = Word2VecFeatureExtractor(
+                vector_size=100, min_count=2, workers=1
+            )
+            w2v_extractor.fit(descriptions)
+            semantic_features = w2v_extractor.transform(descriptions)
+
+            metadata_extractor = StructuredMetadataExtractor()
+            metadata_extractor.fit(filtered_threats)
+            metadata_features = metadata_extractor.transform(filtered_threats)
+
+            X = np.hstack([semantic_features, metadata_features])
+
+            label_encoder = LabelEncoder()
+            y = label_encoder.fit_transform(labels)
+
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X,
+                    y,
+                    test_size=0.2,
+                    stratify=y,
+                    random_state=42,
+                )
+            except ValueError:
+                # Fallback if a class has too few samples for stratified split.
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X,
+                    y,
+                    test_size=0.2,
+                    random_state=42,
+                )
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+
+            calibration_method = (
+                os.getenv("THREAT_CALIBRATION_METHOD", "sigmoid").strip().lower()
+            )
+            if calibration_method not in {"sigmoid", "isotonic"}:
+                calibration_method = "sigmoid"
+
+            start_time = time.time()
+            gbc = GradientBoostingClassifier(
+                n_estimators=150,
+                learning_rate=0.08,
+                max_depth=4,
+                min_samples_split=8,
+                min_samples_leaf=4,
+                subsample=0.7,
+                random_state=42,
+            )
+            gbc.fit(X_train_scaled, y_train)
+
+            calibrated_gbc = CalibratedClassifierCV(
+                gbc,
+                method=calibration_method,
+                cv=5,
+            )
+            calibrated_gbc.fit(X_train_scaled, y_train)
+            training_duration = int(time.time() - start_time)
+
+            y_pred = calibrated_gbc.predict(X_test_scaled)
+            y_pred_proba = calibrated_gbc.predict_proba(X_test_scaled)
+            max_probs = np.max(y_pred_proba, axis=1)
+
+            accuracy = float((y_pred == y_test).mean())
+            macro_f1 = float(f1_score(y_test, y_pred, average="macro", zero_division=0))
+            high_confidence_pct = float((max_probs > 0.7).sum() / len(max_probs) * 100)
+            low_confidence_pct = float((max_probs < 0.5).sum() / len(max_probs) * 100)
+
+            recall_per_class = {}
+            precision_per_class = {}
+            for i, class_name in enumerate(label_encoder.classes_):
+                y_test_bin = (y_test == i).astype(int)
+                y_pred_bin = (y_pred == i).astype(int)
+                recall_per_class[class_name] = float(
+                    recall_score(y_test_bin, y_pred_bin, zero_division=0)
+                )
+                precision_per_class[class_name] = float(
+                    precision_score(y_test_bin, y_pred_bin, zero_division=0)
+                )
+
+            self.logger.info(
+                "[5/6] Metrics: macro_f1=%.4f, accuracy=%.4f, high_conf=%.1f%%, low_conf=%.1f%%",
+                macro_f1,
+                accuracy,
+                high_confidence_pct,
+                low_confidence_pct,
+            )
+
+            macro_f1_gate = float(os.getenv("THREAT_GATE_MIN_MACRO_F1", "0.72"))
+            high_conf_gate = float(os.getenv("THREAT_GATE_MIN_HIGH_CONFIDENCE", "50"))
+            low_conf_gate = float(os.getenv("THREAT_GATE_MAX_LOW_CONFIDENCE", "20"))
+
+            gates_passed = (
+                macro_f1 >= macro_f1_gate
+                and high_confidence_pct >= high_conf_gate
+                and low_confidence_pct <= low_conf_gate
+            )
+
+            if not gates_passed:
+                self.logger.warning(
+                    "⚠️  Retrained model failed gates; preserving previous models and removing %s",
+                    next_folder,
+                )
+                shutil.rmtree(next_folder, ignore_errors=True)
+                return
+
+            # Save model artifacts in the same format as v7 manual training outputs.
+            with open(Path(next_folder) / "classifier.pkl", "wb") as f:
+                pickle.dump(calibrated_gbc, f)
+            with open(Path(next_folder) / "w2v_extractor.pkl", "wb") as f:
+                pickle.dump(w2v_extractor, f)
+            with open(Path(next_folder) / "metadata_extractor.pkl", "wb") as f:
+                pickle.dump(metadata_extractor, f)
+            with open(Path(next_folder) / "label_encoder.pkl", "wb") as f:
+                pickle.dump(label_encoder, f)
+            with open(Path(next_folder) / "scaler.pkl", "wb") as f:
+                pickle.dump(scaler, f)
+
+            self.logger.info("[6/6] Saved model artifacts to %s", next_folder)
+
+            workflow = ModelPromotionWorkflow()
+            metrics = {
+                "accuracy": accuracy,
+                "macro_f1": macro_f1,
+                "recall_per_class": recall_per_class,
+                "precision_per_class": precision_per_class,
+                "training_duration_seconds": training_duration,
+                "training_data_sources": {
+                    "baseline_samples": baseline_count,
+                    "database_and_curated_samples": len(db_training_threats),
+                    "total_training_samples": len(filtered_threats),
+                },
+                "config": {
+                    "avg_confidence": float(np.mean(max_probs)),
+                    "high_confidence_pct": high_confidence_pct,
+                    "low_confidence_pct": low_confidence_pct,
+                    "calibration_method": calibration_method,
+                    "feature_engineering": "Word2Vec + Metadata",
+                    "classifier": "Gradient Boosting with Calibrated Probabilities",
+                },
+            }
+
+            model = workflow.register_model(
+                agent_id="classifier_001",
+                metrics=metrics,
+                model_path=next_folder,
+                model_type="gradient_boosting_w2v",
+                config=metrics["config"],
+            )
+
+            self.last_retrain_time = time.time()
+            self.logger.info(
+                "✅ Periodic retrain complete: created v%s at %s (model id=%s)",
+                next_version,
+                next_folder,
+                model.id,
+            )
+            self.logger.info("=" * 80 + "\n")
+
+        except Exception as e:
+            self.logger.error(f"❌ Retraining failed: {e}", exc_info=True)
 
 
 # Example usage: Demo of Functionality

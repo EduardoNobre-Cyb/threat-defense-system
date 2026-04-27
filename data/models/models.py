@@ -13,6 +13,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
@@ -27,7 +28,26 @@ if not DATABASE_URL:
     raise RuntimeError(
         "DATABASE_URL environment variable not set. Check your .env file."
     )
-engine = create_engine(DATABASE_URL)
+
+# For SQLite: use StaticPool to avoid connection pool exhaustion
+# SQLite doesn't benefit from connection pooling and works better with a single connection
+if "sqlite" in DATABASE_URL:
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    # For PostgreSQL/MySQL: use larger pool with better connection management
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=50,  # More connections in pool
+        max_overflow=100,  # Allow many overflow connections
+        pool_pre_ping=True,  # Verify connections before using
+        pool_recycle=1800,  # Recycle connections every 30 minutes
+        echo_pool=True,  # Log pool events for debugging
+    )
+
 Session = sessionmaker(bind=engine, expire_on_commit=False)
 
 
@@ -140,6 +160,15 @@ class ThreatClassification(Base):
     )  # Second choice if uncertain
     runner_up_confidence = Column(Float, nullable=True)  # Confidence in backup choice
 
+    # Human Review Tracking
+    reviewed_by_analyst = Column(Boolean, default=False)  # Was this manually reviewed?
+    reviewed_by_id = Column(
+        Integer, ForeignKey("analysts.id"), nullable=True
+    )  # WHo reviewed it
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)  # When was it reviewed
+    analyst_notes = Column(
+        Text, nullable=True
+    )  # Any notes from the analyst during review
     timestamp = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -208,12 +237,15 @@ class AnalystCuratedTrainingData(Base):
 
     id = Column(Integer, primary_key=True)
     threat_review_id = Column(
-        Integer, ForeignKey("threat_reviews.id"), nullable=False, index=True
+        Integer, ForeignKey("threat_reviews.id"), nullable=True, index=True
     )
 
     # The training pair
     vulnerability_description = Column(Text, nullable=False)
     analyst_corrected_threat_type = Column(String(120), nullable=False, index=True)
+    analyst_notes = Column(
+        Text, nullable=True
+    )  # Analyst's reasoning for the classification
 
     # Metadata
     threat_severity = Column(String(32), nullable=True)
@@ -399,3 +431,71 @@ class HuntingResult(Base):
 
     # Relationships
     threat = relationship("ThreatClassification")
+
+
+class ExternalIOC(Base):
+    __tablename__ = "external_iocs"
+    id = Column(Integer, primary_key=True)
+
+    indicator_type = Column(String(50))  # IPv4, domain, hash, url, tc.
+    indicator_value = Column(String(500), unique=True, index=True)
+
+    source = Column(String(50))  # OTX, MISP, AbuseDB, etc.
+    severity = Column(String(50))  # critical, high, medium, low
+    threat_actor = Column(String(200))  # APT29, Lazarus, etc. (if known)
+    campaign = Column(String(200))  # "SolarWinds", "ProxyLogon", etc. (if known)
+
+    retrieved_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    ioc_metadata = Column(
+        JSON
+    )  # Story any additional context, tags etc. from the source
+
+
+class Model(Base):
+    __tablename__ = "models"
+    id = Column(Integer, primary_key=True)
+
+    agent_id = Column(String(50))  # Classifier, hunter
+    model_type = Column(String(50))  # nb, svm, ensemble
+    version = Column(String(64), unique=True)  # e.g. nb_v1, ensemble_v2
+
+    # Performance Metrics
+    accuracy = Column(Float)
+    macro_f1 = Column(Float)
+    recall_per_class = Column(JSON)  # {"ransomware": 0.8, "phishing": 0.75, ...}
+    precision_per_class = Column(JSON)
+
+    # Training Metadata
+    training_date = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    training_data_sources = Column(
+        JSON
+    )  # {"original": 50, "modern": 155, "analyst": 30}
+    training_duration_seconds = Column(Integer)
+
+    # Status
+    is_active = Column(Boolean, default=False)  # Currently deployed
+
+    # Approval
+    is_approved = Column(Boolean, default=False)  # Passed QA gates
+    approved_by = Column(Integer, ForeignKey("analysts.id"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Rejection
+    is_rejected = Column(Boolean, default=False)
+    rejected_by = Column(Integer, ForeignKey("analysts.id"), nullable=True)
+    rejected_at = Column(DateTime(timezone=True), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+
+    # Artifacts
+    model_path = Column(String(255))  # Path ot .pkl file
+    config = Column(JSON)  # Hyperparameters, vectorizer settings, etc.
+
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )

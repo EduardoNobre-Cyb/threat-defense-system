@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 import logging
 from shared.logging_config import setup_agent_logger
 import re
+from opentelemetry import trace, metrics
 
 # Create tables if the don't exist (run once)
 Base.metadata.create_all(engine)
@@ -183,6 +184,14 @@ class ThreatModelAgent:
             0  # Track last analyzed log entry ID for incremental analysis
         )
         self.cve_min_year = int(os.getenv("CVE_MIN_YEAR", "2018"))
+        self.tracer = trace.get_tracer(self.agent_id)
+        self.meter = metrics.get_meter(self.agent_id)
+        self.model_time = self.meter.create_histogram("model_latency_ms")
+        self.modeled_count = self.meter.create_counter("threats_modeled")
+        self.graph_time = self.meter.create_histogram("graph_latency_ms")
+        self.graph_nodes = self.meter.create_counter("attack_graph_nodes")
+        self.scenarios_time = self.meter.create_histogram("scenarios_latency_ms")
+        self.scenarios_count = self.meter.create_counter("threat_scenarios")
 
     def ingest_all_logs(self):
         """Ingest all log files in the log directory."""
@@ -274,8 +283,12 @@ class ThreatModelAgent:
         else:
             self.mitre_data = None
 
+        neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        neo4j_username = os.getenv("NEO4J_USERNAME", "neo4j")
+        neo4j_password = os.getenv("NEO4J_PASSWORD", "neo4j")
         self.neo4j_driver = GraphDatabase.driver(
-            "bolt://localhost:7687", auth=("neo4j", "Xh%0Lf5tPPXL&U*s")
+            neo4j_uri,
+            auth=(neo4j_username, neo4j_password),
         )
 
         self.cve_fetcher = CVEFetcher(api_key=os.getenv("VULNERS_API_KEY"))
@@ -327,10 +340,7 @@ class ThreatModelAgent:
             self._new_logs_detected = True
             self.logger.info("✅ New log(s) ingested — will re-run threat modeling")
 
-    # def handle_system_event(self, message: Dict):
-    # # Handle incoming system events
-    #   print(f"[{self.agent_id}] Received system event: {message}.get('type')}")
-    # # Process system event messages
+    # TODO: Add system event handling
 
     def publish_threat_model(self, threat_data: Dict):
         # Publish updated threat model to message bus
@@ -347,324 +357,376 @@ class ThreatModelAgent:
 
     def analyze_logs_for_system_architecture(self) -> Dict:
         """Analyze ingested logs to discover system architecture and build attack surfaces"""
-        self.logger.info(
-            "Analyzing ingested logs for system architecture and attack surfaces..."
-        )
+        with self.tracer.start_as_current_span(
+            "analyze_logs_for_system_architecture"
+        ) as span:
+            span.set_attribute("log_dir", self.log_dir)
 
-        from data.models.models import LogEvent, get_session
-        import json
+            start = time.time()
 
-        session = get_session()
-        discovered_config = {
-            "web_apps": [],
-            "apis": [],
-            "services": [],
-            "databases": [],
-            "network_devices": [],
-        }
-
-        try:
-            # Get recent logs to analyze
-            logs = (
-                session.query(LogEvent)
-                .filter(LogEvent.id > self._last_analyzed_log_id)
-                .order_by(LogEvent.id.asc())
-                .all()
+            self.logger.info(
+                "Analyzing ingested logs for system architecture and attack surfaces..."
             )
-            self.logger.info("Analyzing %d recent log entries...", len(logs))
-            if logs:
-                self._last_analyzed_log_id = max(
-                    log.id for log in logs
-                )  # Update last analyzed log ID
-            discovered_services = set()
-            discovered_apis = set()
-            discovered_web_apps = set()
-            discovered_databases = set()
-            error_patterns = []
-            # Track specific software names so CVE queries are targeted
-            discovered_web_software: set = set()
-            discovered_network_software: set = set()
-            discovered_db_software: set = set()
-            # Explicit CVE IDs found directly in log entries
-            discovered_explicit_cve_ids: set = set()
 
-            for log in logs:
-                # Parse the JSON data if available
-                parsed_data = {}
-                if log.data:
-                    try:
-                        parsed_data = json.loads(log.data)
-                    except:
-                        pass
+            from data.models.models import LogEvent, get_session
+            import json
 
-                # Use parsed data or fall back to message
-                message = (log.message or "").lower()
-                service = parsed_data.get("service", "").lower()
-                level = (log.level or parsed_data.get("level", "")).upper()
+            session = get_session()
+            discovered_config = {
+                "web_apps": [],
+                "apis": [],
+                "services": [],
+                "databases": [],
+                "network_devices": [],
+            }
 
-                if not message and not service:
-                    continue
+            try:
+                # Get recent logs to analyze
+                logs = (
+                    session.query(LogEvent)
+                    .filter(LogEvent.id > self._last_analyzed_log_id)
+                    .order_by(LogEvent.id.asc())
+                    .all()
+                )
+                self.logger.info("Analyzing %d recent log entries...", len(logs))
+                if logs:
+                    self._last_analyzed_log_id = max(
+                        log.id for log in logs
+                    )  # Update last analyzed log ID
+                discovered_services = set()
+                discovered_apis = set()
+                discovered_web_apps = set()
+                discovered_databases = set()
+                error_patterns = []
+                # Track specific software names so CVE queries are targeted
+                discovered_web_software: set = set()
+                discovered_network_software: set = set()
+                discovered_db_software: set = set()
+                # Explicit CVE IDs found directly in log entries
+                discovered_explicit_cve_ids: set = set()
 
-                # Pick up explicit CVE IDs embedded in structured log data
-                raw_cve = parsed_data.get("cve_id") or parsed_data.get("cve")
-                if (
-                    raw_cve
-                    and isinstance(raw_cve, str)
-                    and raw_cve.upper().startswith("CVE-")
-                ):
-                    discovered_explicit_cve_ids.add(raw_cve.upper())
+                for log in logs:
+                    # Parse the JSON data if available
+                    parsed_data = {}
+                    if log.data:
+                        try:
+                            parsed_data = json.loads(log.data)
+                        except:
+                            pass
 
-                # ── Dynamic software name extraction ───────────────────────────────
-                # Primary source: the structured `service` field from JSON / CSV /
-                # syslog (the ingestor's RFC-3164 regex already populates it for raw
-                # syslogs; the CSV fix now preserves column names too).
-                # Fallback: a lightweight regex on the raw message for any format
-                # that didn't produce a service field.
-                # Classification uses two small anchor-sets (web / db).  Anything
-                # not in either set goes to network_software and is still queried
-                # against Vulners, so entirely new services are handled automatically
-                # without changing any code.
-                _WEB_ANCHORS = {
-                    "nginx",
-                    "apache",
-                    "httpd",
-                    "iis",
-                    "tomcat",
-                    "lighttpd",
-                    "caddy",
-                }
-                _DB_ANCHORS = {
-                    "mysql",
-                    "postgres",
-                    "postgresql",
-                    "mongodb",
-                    "redis",
-                    "oracle",
-                    "mssql",
-                    "sqlite",
-                    "mariadb",
-                    "cassandra",
-                    "elasticsearch",
-                }
-                # Noise words that can appear before a colon in syslog messages
-                # but are not process names.
-                _SKIP_WORDS = {
-                    "error",
-                    "warning",
-                    "warn",
-                    "info",
-                    "debug",
-                    "notice",
-                    "critical",
-                    "failed",
-                    "the",
-                    "for",
-                    "from",
-                    "to",
-                    "at",
-                    "in",
-                    "on",
-                }
-                _PROC_RE = re.compile(r"\b([a-z][a-z0-9_-]{1,24})(?:\[\d+\])?:", re.I)
+                    # Use parsed data or fall back to message
+                    message = (log.message or "").lower()
+                    service = parsed_data.get("service", "").lower()
+                    level = (log.level or parsed_data.get("level", "")).upper()
 
-                sw_name = service  # already lowercase from parsed_data.get("service")
+                    if not message and not service:
+                        continue
 
-                if not sw_name and message:
-                    m_proc = _PROC_RE.search(message)
-                    if m_proc:
-                        candidate = m_proc.group(1).lower()
-                        if candidate not in _SKIP_WORDS:
-                            sw_name = candidate
-
-                # Strip trailing version digits (apache2 → apache, openssl3 → openssl)
-                if sw_name:
-                    sw_name = re.sub(r"\d+$", "", sw_name).strip("-_")
-
-                if sw_name:
-                    if sw_name in _WEB_ANCHORS:
-                        discovered_web_software.add(sw_name)
-                    elif sw_name in _DB_ANCHORS:
-                        discovered_db_software.add(sw_name)
-                    else:
-                        discovered_network_software.add(sw_name)
-
-                # Enhanced service detection using structured data
-                if service or any(
-                    svc in message
-                    for svc in ["apache", "nginx", "iis", "httpd", "tomcat"]
-                ):
-                    # Detect web applications
+                    # Pick up explicit CVE IDs embedded in structured log data
+                    raw_cve = parsed_data.get("cve_id") or parsed_data.get("cve")
                     if (
-                        "portal" in message
-                        or parsed_data.get("url", "").find("portal") != -1
+                        raw_cve
+                        and isinstance(raw_cve, str)
+                        and raw_cve.upper().startswith("CVE-")
                     ):
-                        discovered_web_apps.add(
-                            ("Customer Portal", True, False)
-                        )  # public, no input validation
-                    elif "admin" in message or "dashboard" in message:
-                        discovered_web_apps.add(
-                            ("Admin Dashboard", False, True)
-                        )  # internal, has input validation
-                    elif service in ["apache2", "nginx", "httpd", "iis", "tomcat"]:
-                        discovered_web_apps.add(
-                            (f"{service.title()} Web Server", True, False)
-                        )
+                        discovered_explicit_cve_ids.add(raw_cve.upper())
 
-                # Detect APIs
-                if any(
-                    pattern in message
-                    for pattern in ["api", "rest", "endpoint", "json"]
-                ):
-                    if "external" in message or "public" in message:
-                        discovered_apis.add(
-                            ("REST API", True, True)
-                        )  # public, authenticated
-                    else:
-                        discovered_apis.add(
-                            ("Internal API", False, True)
-                        )  # internal, authenticated
-
-                # Detect databases
-                if any(
-                    pattern in message
-                    for pattern in [
+                    # Extract software name from service field or message
+                    _WEB_ANCHORS = {
+                        "nginx",
+                        "apache",
+                        "httpd",
+                        "iis",
+                        "tomcat",
+                        "lighttpd",
+                        "caddy",
+                    }
+                    _DB_ANCHORS = {
                         "mysql",
+                        "postgres",
                         "postgresql",
                         "mongodb",
                         "redis",
-                        "database",
-                        "db",
-                    ]
-                ):
-                    if "error" in message or "failed" in message:
-                        discovered_databases.add(
-                            ("Database Server", False, False)
-                        )  # internal, has issues
-                    else:
-                        discovered_databases.add(
-                            ("Database Server", False, True)
-                        )  # internal, secure
-
-                # Detect other services (network layer)
-                if any(
-                    pattern in message
-                    for pattern in [
-                        "ssh",
-                        "ftp",
-                        "smtp",
-                        "dns",
-                        "haproxy",
-                        "openssl",
-                        "snmp",
-                    ]
-                ):
-                    service_name = next(
-                        (
-                            s
-                            for s in [
-                                "ssh",
-                                "ftp",
-                                "smtp",
-                                "dns",
-                                "haproxy",
-                                "openssl",
-                                "snmp",
-                            ]
-                            if s in message
-                        ),
-                        "Unknown Service",
-                    )
-                    discovered_services.add(
-                        (f"{service_name.upper()} Service", False, True)
+                        "oracle",
+                        "mssql",
+                        "sqlite",
+                        "mariadb",
+                        "cassandra",
+                        "elasticsearch",
+                    }
+                    # Noise words that can appear before a colon in syslog messages
+                    # but are not process names.
+                    _SKIP_WORDS = {
+                        "error",
+                        "warning",
+                        "warn",
+                        "info",
+                        "debug",
+                        "notice",
+                        "critical",
+                        "failed",
+                        "the",
+                        "for",
+                        "from",
+                        "to",
+                        "at",
+                        "in",
+                        "on",
+                    }
+                    _PROC_RE = re.compile(
+                        r"\b([a-z][a-z0-9_-]{1,24})(?:\[\d+\])?:", re.I
                     )
 
-                # Collect error patterns for vulnerability analysis
-                if any(
-                    pattern in message
-                    for pattern in ["error", "failed", "exception", "denied"]
-                ):
-                    error_patterns.append(message)
+                    sw_name = (
+                        service  # already lowercase from parsed_data.get("service")
+                    )
 
-            if discovered_explicit_cve_ids:
-                self.logger.info(
-                    "Detected %d explicit CVE IDs in log entries: %s",
-                    len(discovered_explicit_cve_ids),
-                    ", ".join(sorted(discovered_explicit_cve_ids)),
-                )
-            if discovered_network_software:
-                self.logger.info(
-                    "Detected network software: %s",
-                    ", ".join(sorted(discovered_network_software)),
-                )
+                    if not sw_name and message:
+                        m_proc = _PROC_RE.search(message)
+                        if m_proc:
+                            candidate = m_proc.group(1).lower()
+                            if candidate not in _SKIP_WORDS:
+                                sw_name = candidate
 
-            # Convert discovered items to config format, carrying software names
-            # through so CVE queries can be targeted to actual detected software.
-            _web_sw_list = sorted(discovered_web_software)
-            _net_sw_list = sorted(discovered_network_software)
-            _db_sw_list = sorted(discovered_db_software)
-            _explicit_cves = sorted(discovered_explicit_cve_ids)
+                    # Strip trailing version digits (apache2 → apache, openssl3 → openssl)
+                    if sw_name:
+                        sw_name = re.sub(r"\d+$", "", sw_name).strip("-_")
 
-            discovered_config["web_apps"] = [
-                {
-                    "name": name,
-                    "public_facing": public,
-                    "input_validation": validation,
-                    "auth_implemented": True,
-                    "software_names": _web_sw_list,
-                    "explicit_cve_ids": _explicit_cves,
-                }
-                for name, public, validation in discovered_web_apps
-            ]
+                    if sw_name:
+                        if sw_name in _WEB_ANCHORS:
+                            discovered_web_software.add(sw_name)
+                        elif sw_name in _DB_ANCHORS:
+                            discovered_db_software.add(sw_name)
+                        else:
+                            discovered_network_software.add(sw_name)
 
-            discovered_config["apis"] = [
-                {
-                    "name": name,
-                    "public_facing": public,
-                    "authenticated": auth,
-                    "software_names": _web_sw_list + _net_sw_list,
-                    "explicit_cve_ids": _explicit_cves,
-                }
-                for name, public, auth in discovered_apis
-            ]
+                    # Enhanced service detection using structured data
+                    if service or any(
+                        svc in message
+                        for svc in ["apache", "nginx", "iis", "httpd", "tomcat"]
+                    ):
+                        # Detect web applications
+                        if (
+                            "portal" in message
+                            or parsed_data.get("url", "").find("portal") != -1
+                        ):
+                            discovered_web_apps.add(
+                                ("Customer Portal", True, False)
+                            )  # public, no input validation
+                        elif "admin" in message or "dashboard" in message:
+                            discovered_web_apps.add(
+                                ("Admin Dashboard", False, True)
+                            )  # internal, has input validation
+                        elif service in ["apache2", "nginx", "httpd", "iis", "tomcat"]:
+                            discovered_web_apps.add(
+                                (f"{service.title()} Web Server", True, False)
+                            )
 
-            discovered_config["services"] = [
-                {
-                    "name": name,
-                    "public_facing": public,
-                    "encrypted": encrypted,
-                    "software_names": _net_sw_list,
-                    "explicit_cve_ids": _explicit_cves,
-                }
-                for name, public, encrypted in discovered_services
-            ]
+                    # Detect APIs
+                    if any(
+                        pattern in message
+                        for pattern in ["api", "rest", "endpoint", "json"]
+                    ):
+                        if "external" in message or "public" in message:
+                            discovered_apis.add(
+                                ("REST API", True, True)
+                            )  # public, authenticated
+                        else:
+                            discovered_apis.add(
+                                ("Internal API", False, True)
+                            )  # internal, authenticated
 
-            discovered_config["databases"] = [
-                {
-                    "name": name,
-                    "public_facing": public,
-                    "encrypted": encrypted,
-                    "software_names": _db_sw_list,
-                    "explicit_cve_ids": _explicit_cves,
-                }
-                for name, public, encrypted in discovered_databases
-            ]
+                    # Detect databases
+                    if any(
+                        pattern in message
+                        for pattern in [
+                            "mysql",
+                            "postgresql",
+                            "mongodb",
+                            "redis",
+                            "database",
+                            "db",
+                        ]
+                    ):
+                        if "error" in message or "failed" in message:
+                            discovered_databases.add(
+                                ("Database Server", False, False)
+                            )  # internal, has issues
+                        else:
+                            discovered_databases.add(
+                                ("Database Server", False, True)
+                            )  # internal, secure
 
-            # Add default components if none discovered
-            if not any(
-                [
-                    discovered_web_apps,
-                    discovered_apis,
-                    discovered_services,
-                    discovered_databases,
+                    # Detect other services (network layer)
+                    if any(
+                        pattern in message
+                        for pattern in [
+                            "ssh",
+                            "ftp",
+                            "smtp",
+                            "dns",
+                            "haproxy",
+                            "openssl",
+                            "snmp",
+                        ]
+                    ):
+                        service_name = next(
+                            (
+                                s
+                                for s in [
+                                    "ssh",
+                                    "ftp",
+                                    "smtp",
+                                    "dns",
+                                    "haproxy",
+                                    "openssl",
+                                    "snmp",
+                                ]
+                                if s in message
+                            ),
+                            "Unknown Service",
+                        )
+                        discovered_services.add(
+                            (f"{service_name.upper()} Service", False, True)
+                        )
+
+                    # Collect error patterns for vulnerability analysis
+                    if any(
+                        pattern in message
+                        for pattern in ["error", "failed", "exception", "denied"]
+                    ):
+                        error_patterns.append(message)
+
+                if discovered_explicit_cve_ids:
+                    self.logger.info(
+                        "Detected %d explicit CVE IDs in log entries: %s",
+                        len(discovered_explicit_cve_ids),
+                        ", ".join(sorted(discovered_explicit_cve_ids)),
+                    )
+                if discovered_network_software:
+                    self.logger.info(
+                        "Detected network software: %s",
+                        ", ".join(sorted(discovered_network_software)),
+                    )
+
+                # Convert discovered items to config format, carrying software names
+                # through so CVE queries can be targeted to actual detected software.
+                _web_sw_list = sorted(discovered_web_software)
+                _net_sw_list = sorted(discovered_network_software)
+                _db_sw_list = sorted(discovered_db_software)
+                _explicit_cves = sorted(discovered_explicit_cve_ids)
+
+                discovered_config["web_apps"] = [
+                    {
+                        "name": name,
+                        "public_facing": public,
+                        "input_validation": validation,
+                        "auth_implemented": True,
+                        "software_names": _web_sw_list,
+                        "explicit_cve_ids": _explicit_cves,
+                    }
+                    for name, public, validation in discovered_web_apps
                 ]
-            ):
+
+                discovered_config["apis"] = [
+                    {
+                        "name": name,
+                        "public_facing": public,
+                        "authenticated": auth,
+                        "software_names": _web_sw_list + _net_sw_list,
+                        "explicit_cve_ids": _explicit_cves,
+                    }
+                    for name, public, auth in discovered_apis
+                ]
+
+                discovered_config["services"] = [
+                    {
+                        "name": name,
+                        "public_facing": public,
+                        "encrypted": encrypted,
+                        "software_names": _net_sw_list,
+                        "explicit_cve_ids": _explicit_cves,
+                    }
+                    for name, public, encrypted in discovered_services
+                ]
+
+                discovered_config["databases"] = [
+                    {
+                        "name": name,
+                        "public_facing": public,
+                        "encrypted": encrypted,
+                        "software_names": _db_sw_list,
+                        "explicit_cve_ids": _explicit_cves,
+                    }
+                    for name, public, encrypted in discovered_databases
+                ]
+
+                # Add default components if none discovered
+                if not any(
+                    [
+                        discovered_web_apps,
+                        discovered_apis,
+                        discovered_services,
+                        discovered_databases,
+                    ]
+                ):
+                    self.logger.info(
+                        "No specific components detected, using inferred architecture..."
+                    )
+                    discovered_config = {
+                        "web_apps": [
+                            {
+                                "name": "Inferred Web Application",
+                                "public_facing": True,
+                                "input_validation": False,
+                                "auth_implemented": True,
+                            }
+                        ],
+                        "apis": [
+                            {
+                                "name": "Inferred API Endpoint",
+                                "public_facing": True,
+                                "authenticated": True,
+                            }
+                        ],
+                        "services": [
+                            {
+                                "name": "Inferred Backend Service",
+                                "public_facing": False,
+                                "encrypted": True,
+                            }
+                        ],
+                        "databases": [],
+                    }
+
+                self.logger.info("Discovered architecture:")
+                self.logger.info("  - Web Apps: %d", len(discovered_config["web_apps"]))
+                self.logger.info("  - APIs: %d", len(discovered_config["apis"]))
+                self.logger.info("  - Services: %d", len(discovered_config["services"]))
                 self.logger.info(
-                    "No specific components detected, using inferred architecture..."
+                    "  - Databases: %d", len(discovered_config["databases"])
                 )
-                discovered_config = {
+                self.logger.info("  - Error patterns found: %d", len(error_patterns))
+
+                # Now analyze the discovered config to build attack surfaces
+                self.logger.info(
+                    "Building attack surfaces from discovered architecture..."
+                )
+                attack_surfaces = self.analyze_system_architecture(discovered_config)
+
+                latency_ms = (time.time() - start) * 1000
+                self.model_time.record(latency_ms)
+                self.modeled_count.add(1)
+
+                return attack_surfaces
+
+            except Exception as e:
+                self.logger.error("Error analyzing logs: %s", e)
+                # Fallback to basic inferred architecture
+                fallback_config = {
                     "web_apps": [
                         {
-                            "name": "Inferred Web Application",
+                            "name": "Unknown Web Application",
                             "public_facing": True,
                             "input_validation": False,
                             "auth_implemented": True,
@@ -672,14 +734,14 @@ class ThreatModelAgent:
                     ],
                     "apis": [
                         {
-                            "name": "Inferred API Endpoint",
+                            "name": "Unknown API",
                             "public_facing": True,
                             "authenticated": True,
                         }
                     ],
                     "services": [
                         {
-                            "name": "Inferred Backend Service",
+                            "name": "Unknown Service",
                             "public_facing": False,
                             "encrypted": True,
                         }
@@ -687,56 +749,16 @@ class ThreatModelAgent:
                     "databases": [],
                 }
 
-            self.logger.info("Discovered architecture:")
-            self.logger.info("  - Web Apps: %d", len(discovered_config["web_apps"]))
-            self.logger.info("  - APIs: %d", len(discovered_config["apis"]))
-            self.logger.info("  - Services: %d", len(discovered_config["services"]))
-            self.logger.info("  - Databases: %d", len(discovered_config["databases"]))
-            self.logger.info("  - Error patterns found: %d", len(error_patterns))
+                latency_ms = (time.time() - start) * 1000
+                self.model_time.record(latency_ms)
+                self.modeled_count.add(1)
 
-            # Now analyze the discovered config to build attack surfaces
-            self.logger.info("Building attack surfaces from discovered architecture...")
-            attack_surfaces = self.analyze_system_architecture(discovered_config)
-            return attack_surfaces
-
-        except Exception as e:
-            self.logger.error("Error analyzing logs: %s", e)
-            # Fallback to basic inferred architecture
-            fallback_config = {
-                "web_apps": [
-                    {
-                        "name": "Unknown Web Application",
-                        "public_facing": True,
-                        "input_validation": False,
-                        "auth_implemented": True,
-                    }
-                ],
-                "apis": [
-                    {
-                        "name": "Unknown API",
-                        "public_facing": True,
-                        "authenticated": True,
-                    }
-                ],
-                "services": [
-                    {
-                        "name": "Unknown Service",
-                        "public_facing": False,
-                        "encrypted": True,
-                    }
-                ],
-                "databases": [],
-            }
-            return self.analyze_system_architecture(fallback_config)
-        finally:
-            session.close()
+                return self.analyze_system_architecture(fallback_config)
+            finally:
+                session.close()
 
     def analyze_system_architecture(self, system_config: Dict) -> Dict:
-
         # Analyze system architecture and identify attack surfaces
-        # Args: system_config: Dictionary containing system components
-        # Returns: Dictionary with identified attack surfaces and vulnerabilities
-
         attack_surfaces = {
             "web_interfaces": [],
             "api_endpoints": [],
@@ -989,9 +1011,7 @@ class ThreatModelAgent:
             session.close()
 
     def add_assets_batch_db(self, asset_data_list):
-        # Batch upsert assets — insert new, return existing if name already present.
-        # This makes Agent 1 safe to restart without duplicating data.
-        # asset_data_list: list of dicts with keys 'name', 'type', 'risk_level'
+        # Batch upsert assets to database
         session = get_session()
         try:
             result = []
@@ -1014,9 +1034,7 @@ class ThreatModelAgent:
             session.close()
 
     def add_vulns_batch_db(self, vuln_data_list):
-        # Batch upsert vulnerabilities — insert new, return existing if name already present.
-        # This makes Agent 1 safe to restart without duplicating data.
-        # vuln_data_list: list of dicts with keys 'name', 'description', 'severity'
+        # Batch upsert vulnerabilities to database
         session = get_session()
         try:
             result = []
@@ -1044,43 +1062,51 @@ class ThreatModelAgent:
 
     def build_attack_graph(self, attack_surfaces: Dict) -> Dict:
         # Build attack graph from identified attack surfaces
-        # Args: attack_surfaces: Dictionary of attack surfaces
-        # Returns: Attack graph with nodes and edges
+        with self.tracer.start_as_current_span("build_attack_graph") as span:
+            span.set_attribute("surface_count", len(attack_surfaces))
 
-        self.logger.info("Building attack graph")
+            start = time.time()
 
-        attack_graph = {"nodes": [], "edges": [], "critical_paths": []}
+            self.logger.info("Building attack graph")
 
-        node_id = 0
-        for surface_type, surfaces in attack_surfaces.items():
-            for surface in surfaces:
-                node_identifier = f"node_{node_id}"
-                node = {
-                    "id": node_identifier,
-                    "type": surface_type,
-                    "name": surface.get("name"),
-                    "risk_level": surface.get("risk_level", "medium"),
-                    "vulnerabilities": surface.get("vulnerabilities", []),
-                }
-                attack_graph["nodes"].append(node)
+            attack_graph = {"nodes": [], "edges": [], "critical_paths": []}
 
-                # Persist asset node to Neo4j
-                self.add_asset_neo4j(node_identifier, surface_type)
-                # Persist vulnerabilities and relationships to Neo4j
-                for vuln in node["vulnerabilities"]:
-                    # Extract CVE ID if it's a dictionary
-                    vuln_name = vuln.get("cve_id") if isinstance(vuln, dict) else vuln
-                    self.add_vuln_neo4j(node_identifier, vuln_name)
+            node_id = 0
+            for surface_type, surfaces in attack_surfaces.items():
+                for surface in surfaces:
+                    node_identifier = f"node_{node_id}"
+                    node = {
+                        "id": node_identifier,
+                        "type": surface_type,
+                        "name": surface.get("name"),
+                        "risk_level": surface.get("risk_level", "medium"),
+                        "vulnerabilities": surface.get("vulnerabilities", []),
+                    }
+                    attack_graph["nodes"].append(node)
 
-                node_id += 1
+                    # Persist asset node to Neo4j
+                    self.add_asset_neo4j(node_identifier, surface_type)
+                    # Persist vulnerabilities and relationships to Neo4j
+                    for vuln in node["vulnerabilities"]:
+                        # Extract CVE ID if it's a dictionary
+                        vuln_name = (
+                            vuln.get("cve_id") if isinstance(vuln, dict) else vuln
+                        )
+                        self.add_vuln_neo4j(node_identifier, vuln_name)
 
-        # Create edges (attack paths)
-        attack_graph["edges"] = self._generate_attack_paths(attack_graph["nodes"])
+                    node_id += 1
+            # Create edges (attack paths)
+            attack_graph["edges"] = self._generate_attack_paths(attack_graph["nodes"])
 
-        self.logger.info(
-            "Attack graph created with %d nodes", len(attack_graph["nodes"])
-        )
-        return attack_graph
+            self.logger.info(
+                "Attack graph created with %d nodes", len(attack_graph["nodes"])
+            )
+
+            latency_ms = (time.time() - start) * 1000
+            self.graph_time.record(latency_ms)
+            self.graph_nodes.add(len(attack_graph["nodes"]))
+
+            return attack_graph
 
     def _get_mitre_tactics(self, vulnerabilities: list) -> list:
         # Get MITRE tactics for a list of vulnerabilities.
@@ -1092,94 +1118,101 @@ class ThreatModelAgent:
     def generate_threat_scenarios(
         self, attack_graph: Dict, system_config: Dict = None
     ) -> List[Dict]:
+        # Generate threat scenarios from attack graph
+        with self.tracer.start_as_current_span("generate_threat_scenarios") as span:
+            span.set_attribute("graph_nodes", len(attack_graph.get("nodes", [])))
 
-        # Generate "what-if" attack scenarios based on attack graph
-        # Args: attack_graph: Attack graph structure
-        #       system_config: Optional system configuration for context
-        # Returns: List of threat scenarios
+            start = time.time()
 
-        self.logger.info("Generating threat scenarios from actual attack graph data...")
-        scenarios = []
-        seen_cves = set()
+            self.logger.info(
+                "Generating threat scenarios from actual attack graph data..."
+            )
+            scenarios = []
+            seen_cves = set()
 
-        for node_idx, node in enumerate(attack_graph.get("nodes", [])):
-            asset_name = node.get("name", "Unknown Asset")
-            asset_type = node.get("type", "unknown")
+            for node_idx, node in enumerate(attack_graph.get("nodes", [])):
+                asset_name = node.get("name", "Unknown Asset")
+                asset_type = node.get("type", "unknown")
 
-            for vuln_dict in node.get("vulnerabilities", []):
-                # Normalise: vulns may be strings or dicts depending on code path
-                if isinstance(vuln_dict, str):
-                    cve_id = vuln_dict
-                    description = vuln_dict
-                    cvss_score = 5.0
-                    cvss_vector = ""
-                    severity = "medium"
-                else:
-                    cve_id = vuln_dict.get("cve_id", "Unknown")
-                    description = vuln_dict.get("description", cve_id)
-                    cvss_score = float(vuln_dict.get("cvss_score") or 5.0)
-                    cvss_vector = vuln_dict.get("cvss_vector", "")
-                    severity = vuln_dict.get("severity", "medium")
+                for vuln_dict in node.get("vulnerabilities", []):
+                    # Normalise: vulns may be strings or dicts depending on code path
+                    if isinstance(vuln_dict, str):
+                        cve_id = vuln_dict
+                        description = vuln_dict
+                        cvss_score = 5.0
+                        cvss_vector = ""
+                        severity = "medium"
+                    else:
+                        cve_id = vuln_dict.get("cve_id", "Unknown")
+                        description = vuln_dict.get("description", cve_id)
+                        cvss_score = float(vuln_dict.get("cvss_score") or 5.0)
+                        cvss_vector = vuln_dict.get("cvss_vector", "")
+                        severity = vuln_dict.get("severity", "medium")
 
-                if cve_id in seen_cves:
-                    continue
-                seen_cves.add(cve_id)
+                    if cve_id in seen_cves:
+                        continue
+                    seen_cves.add(cve_id)
 
-                attack_chain = _derive_attack_chain(description)
-                likelihood = _derive_likelihood(cvss_vector, cvss_score)
-                impact = (
-                    "critical"
-                    if cvss_score >= 9.0
-                    else (
-                        "high"
-                        if cvss_score >= 7.0
-                        else "medium" if cvss_score >= 4.0 else "low"
+                    attack_chain = _derive_attack_chain(description)
+                    likelihood = _derive_likelihood(cvss_vector, cvss_score)
+                    impact = (
+                        "critical"
+                        if cvss_score >= 9.0
+                        else (
+                            "high"
+                            if cvss_score >= 7.0
+                            else "medium" if cvss_score >= 4.0 else "low"
+                        )
                     )
+                    techniques = self.get_techniques_for_vuln(cve_id, asset_type)
+
+                    # Use first sentence of description as scenario name cap
+                    short_desc = description.split(".")[0][:80]
+                    scenario_name = f"{cve_id}: {short_desc}"
+
+                    scenarios.append(
+                        {
+                            "id": f"scenario_{cve_id.replace('-','_').lower()}",
+                            "name": scenario_name,
+                            "asset": asset_name,
+                            "attack_chain": attack_chain,
+                            "likelihood": likelihood,
+                            "impact": impact,
+                            "mitre_techniques": techniques,
+                            "vulnerabilities_exploited": [cve_id],
+                            "cvss_score": cvss_score,
+                        }
+                    )
+
+            # Fallback if no CVEs were found in graph
+            if not scenarios:
+                self.logger.warning(
+                    "No CVEs in attack graph — using generic fallback scenario"
                 )
-                techniques = self.get_techniques_for_vuln(cve_id, asset_type)
-
-                # Use first sentence of description as scenario name cap
-                short_desc = description.split(".")[0][:80]
-                scenario_name = f"{cve_id}: {short_desc}"
-
                 scenarios.append(
                     {
-                        "id": f"scenario_{cve_id.replace('-','_').lower()}",
-                        "name": scenario_name,
-                        "asset": asset_name,
-                        "attack_chain": attack_chain,
-                        "likelihood": likelihood,
-                        "impact": impact,
-                        "mitre_techniques": techniques,
-                        "vulnerabilities_exploited": [cve_id],
-                        "cvss_score": cvss_score,
+                        "id": "scenario_generic_001",
+                        "name": "Generic Threat: Unidentified Attack Surface",
+                        "asset": "Unknown",
+                        "attack_chain": ["Reconnaissance", "Exploitation", "Impact"],
+                        "likelihood": "medium",
+                        "impact": "medium",
+                        "mitre_techniques": [],
+                        "vulnerabilities_exploited": [],
                     }
                 )
 
-        # Fallback if no CVEs were found in graph
-        if not scenarios:
-            self.logger.warning(
-                "No CVEs in attack graph — using generic fallback scenario"
-            )
-            scenarios.append(
-                {
-                    "id": "scenario_generic_001",
-                    "name": "Generic Threat: Unidentified Attack Surface",
-                    "asset": "Unknown",
-                    "attack_chain": ["Reconnaissance", "Exploitation", "Impact"],
-                    "likelihood": "medium",
-                    "impact": "medium",
-                    "mitre_techniques": [],
-                    "vulnerabilities_exploited": [],
-                }
+            self.logger.info(
+                "Generated %d dynamic threat scenarios from %d unique CVEs",
+                len(scenarios),
+                len(seen_cves),
             )
 
-        self.logger.info(
-            "Generated %d dynamic threat scenarios from %d unique CVEs",
-            len(scenarios),
-            len(seen_cves),
-        )
-        return scenarios
+            latency_ms = (time.time() - start) * 1000
+            self.scenarios_time.record(latency_ms)
+            self.scenarios_count.add(len(scenarios))
+
+            return scenarios
 
     def display_attack_paths(self):
         """Display ranked attack paths to analyst in logs."""
@@ -1218,11 +1251,7 @@ class ThreatModelAgent:
         session.close()
 
     def share_intelligence(self, data: Dict) -> Dict:
-
         # Share threat intelligence with other agents
-        # Args: data: Intelligence data to share
-        # Returns: Formatted intelligence package
-
         # Calculate confidence based on data completeness
         confidence = 0.5  # Base confidence
         assets = data.get("assets", 0)
@@ -2013,9 +2042,7 @@ if __name__ == "__main__":
     # Determine verbose mode: True for demo, False for listen
     verbose = args.mode == "demo"  # demo=True (verbose), listen=False (quiet)
 
-    # Send a pre-boot heartbeat so the dashboard shows the agent as "running"
-    # immediately after the user presses Start, before the heavy __init__ work
-    # (MITRE data load, Neo4j connection, CVEFetcher setup) completes.
+    # Send heartbeat so dashboard shows agent running before initialization
     if args.mode == "listen":
         message_bus.heartbeat("threat_model_001")
 
@@ -2144,10 +2171,7 @@ if __name__ == "__main__":
 
                     attack_graph = agent.build_attack_graph(attack_surfaces)
 
-                    # Persist new assets and vulnerabilities to Database so Agent 2
-                    # can find and classify them.  These calls were present in the
-                    # initial-boot path but were missing from the live-cycle path,
-                    # causing Agent 2 to always see "nothing new to classify".
+                    # Persist assets and vulnerabilities to database
                     asset_data, db_assets, vuln_data, db_vulns = (
                         agent._add_assets_and_vulns_db(attack_graph)
                     )

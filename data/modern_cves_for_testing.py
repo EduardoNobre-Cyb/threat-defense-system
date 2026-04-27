@@ -699,13 +699,279 @@ MODERN_TEST_CVES = [
         "Potential lateral movement detected but network segmentation status unknown",
         "Needs Review",
     ),
+    # Additional Injection Attacks
+    (
+        "NoSQL injection in MongoDB query allows arbitrary document retrieval",
+        "Injection Attack",
+    ),
+    (
+        "Cassandra query injection bypasses authentication in distributed database",
+        "Injection Attack",
+    ),
+    (
+        "Perl regex injection in text processing enables arbitrary code execution",
+        "Injection Attack",
+    ),
+    (
+        "Ruby ERB template injection allows server-side code execution",
+        "Injection Attack",
+    ),
+    (
+        "Python Jinja template injection exposes application configuration",
+        "Injection Attack",
+    ),
+    # Additional XSS Variants
+    (
+        "Stored XSS in user profile bypasses HTML sanitization via nested encoding",
+        "Cross-Site Scripting",
+    ),
+    (
+        "Reflected XSS in search parameter uses HTML5 data attributes",
+        "Cross-Site Scripting",
+    ),
+    (
+        "DOM-based XSS via location.hash manipulation in SPAs",
+        "Cross-Site Scripting",
+    ),
+    (
+        "XSS via event handler attributes in dynamically generated HTML",
+        "Cross-Site Scripting",
+    ),
+    (
+        "Polyglot attack combining SVG and JavaScript XSS vector",
+        "Cross-Site Scripting",
+    ),
+    # Additional Auth Bypass
+    (
+        "LDAP injection in login form bypasses authentication",
+        "Authentication Bypass",
+    ),
+    (
+        "SQL injection in authentication query allows login without password",
+        "Authentication Bypass",
+    ),
+    (
+        "Race condition in 2FA validation window enables bypass",
+        "Authentication Bypass",
+    ),
+    (
+        "Weak password reset token generation allows token prediction",
+        "Authentication Bypass",
+    ),
+    (
+        "Session fixation in password reset flow compromises account",
+        "Authentication Bypass",
+    ),
+    # Additional Privilege Escalation
+    (
+        "Insecure direct object reference in admin interface allows privilege escalation",
+        "Privilege Escalation",
+    ),
+    (
+        "File permissions confusion allows group member to access admin files",
+        "Privilege Escalation",
+    ),
+    (
+        "Kernel module loading vulnerability enables kernel privilege escalation",
+        "Privilege Escalation",
+    ),
+    (
+        "Insecure systemd service file allows user to escalate to system owner",
+        "Privilege Escalation",
+    ),
+    (
+        "Capability misconfiguration in container allows breakout",
+        "Privilege Escalation",
+    ),
+    # Additional Memory Corruption
+    (
+        "Integer overflow in size calculation leads to heap buffer overflow",
+        "Memory Corruption",
+    ),
+    (
+        "Type confusion in object handling enables arbitrary memory write",
+        "Memory Corruption",
+    ),
+    (
+        "Use-after-free in event handler cleanup enables code execution",
+        "Memory Corruption",
+    ),
+    (
+        "Memory leak in parser accumulates objects until OOM",
+        "Memory Corruption",
+    ),
+    (
+        "Control flow attack via corrupted virtual method table pointer",
+        "Memory Corruption",
+    ),
+    # Additional DoS Attacks
+    (
+        "Zip bomb with nested compression exhausts system resources",
+        "Denial of Service",
+    ),
+    (
+        "Gzip compression bomb depletes disk space during decompression",
+        "Denial of Service",
+    ),
+    (
+        "Malicious PDF with excessive page count causes parser hang",
+        "Denial of Service",
+    ),
+    (
+        "Regular expression with catastrophic backtracking freezes application",
+        "Denial of Service",
+    ),
+    (
+        "Billion laughs XML attack via recursive entity expansion",
+        "Denial of Service",
+    ),
+    # Additional Path Traversal
+    (
+        "Case-insensitive filesystem traversal on Windows systems",
+        "Path Traversal",
+    ),
+    (
+        "TOCTOU race condition enables file access after validation",
+        "Path Traversal",
+    ),
+    (
+        "Alternate data stream access via colon notation on Windows",
+        "Path Traversal",
+    ),
+    (
+        "Mounted filesystem traversal via /proc filesystem",
+        "Path Traversal",
+    ),
+    (
+        "Symlink race window enables overwriting arbitrary files",
+        "Path Traversal",
+    ),
+    # Additional RCE Vectors
+    (
+        "Insecure temporary file creation enables arbitrary file execution",
+        "Remote Code Execution",
+    ),
+    (
+        "ImageMagick command injection via image filename processing",
+        "Remote Code Execution",
+    ),
+    (
+        "FFmpeg command injection in video transcoding pipeline",
+        "Remote Code Execution",
+    ),
+    (
+        "Ghostscript command injection in PDF processing",
+        "Remote Code Execution",
+    ),
+    (
+        "Template engine code injection enables arbitrary code execution",
+        "Code Execution",
+    ),
+    # Additional Information Disclosure
+    (
+        "HTTP response splitting reveals internal session tokens",
+        "Information Disclosure",
+    ),
+    (
+        "Verbose error pages expose system paths and library versions",
+        "Information Disclosure",
+    ),
+    (
+        "REST API response includes sensitive fields in bulk export",
+        "Information Disclosure",
+    ),
+    (
+        "Cache poisoning reveals user session data to other clients",
+        "Information Disclosure",
+    ),
+    (
+        "CORS misconfiguration allows cross-origin JavaScript access to sensitive data",
+        "Information Disclosure",
+    ),
+    # Additional CSRF Variants
+    (
+        "CSRF in DELETE endpoint via image src attribute",
+        "Cross-Site Request Forgery",
+    ),
+    (
+        "CSRF token in URL query parameter instead of body enables bypass",
+        "Cross-Site Request Forgery",
+    ),
+    (
+        "CSRF protection disabled for certain endpoints",
+        "Cross-Site Request Forgery",
+    ),
+    (
+        "CSRF token validation only checks presence, not value",
+        "Cross-Site Request Forgery",
+    ),
+    # Additional Clickjacking
+    (
+        "Frame-busting code bypass via double-frame nesting",
+        "Clickjacking",
+    ),
+    (
+        "Clickjacking combined with social engineering via fake warning",
+        "Clickjacking",
+    ),
+    (
+        "Touch-jacking attack on mobile enables unauthorized actions",
+        "Clickjacking",
+    ),
+    # Additional Input Validation
+    (
+        "File upload validation bypass via polyglot PHP-GIF file",
+        "Input Validation",
+    ),
+    (
+        "MIME type confusion via Content-Type header mismatch",
+        "Input Validation",
+    ),
+    (
+        "Archive extraction without size validation enables decompression bomb",
+        "Input Validation",
+    ),
+    (
+        "Name resolution bypass via mixed case domain in certificate check",
+        "Input Validation",
+    ),
+    # Additional Crypto Issues
+    (
+        "Phantom SSL certificate accepted due to improper validation",
+        "Cryptographic Weakness",
+    ),
+    (
+        "Weak random number generator seeds enable token prediction",
+        "Cryptographic Weakness",
+    ),
+    (
+        "Two-phase commit vulnerability in cryptographic operations",
+        "Cryptographic Weakness",
+    ),
+    (
+        "Insecure cryptographic salt reuse reduces password entropy",
+        "Cryptographic Weakness",
+    ),
+    # Additional SSRF
+    (
+        "SSRF in background job processing accesses internal services",
+        "Server-Side Request Forgery",
+    ),
+    (
+        "SSRF via DNS rebinding bypasses IP-based blacklist",
+        "Server-Side Request Forgery",
+    ),
+    (
+        "SSRF in file inclusion via gopher protocol handler",
+        "Server-Side Request Forgery",
+    ),
 ]
 
 
 def get_modern_test_cves():
     """Return list of (description, threat_type) tuples for testing.
 
-    Contains 155+ modern threat examples for evaluating model generalization.
+    Contains 200+ modern threat examples for evaluating model generalization.
     Each example is (threat_description, threat_type_label).
     """
     return MODERN_TEST_CVES

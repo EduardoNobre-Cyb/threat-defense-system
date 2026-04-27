@@ -20,12 +20,15 @@ from data.models.models import (
     get_session,
     ResponseAction as ResponseActionModel,
     EmailNotification,
+    ThreatClassification,
+    Vulnerability,
 )
 import os
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash
 import logging
 from shared.logging_config import setup_agent_logger
+from opentelemetry import trace, metrics
 
 load_dotenv()
 
@@ -50,10 +53,7 @@ class EmailNotificationSystem:
         self.password = os.getenv("SMTP_PASSWORD")
         self.use_tls = True
         self.from_email = self.username
-
-        # For demo purposes: all emails are actually delivered to this one inbox
-        # but verbose output still shows all analyst names/emails from the database.
-        # Set to None to send to real analyst emails in production.
+        # Demo mode: all emails routed to demo inbox
         self.demo_recipient = os.getenv("DEMO_RECIPIENT")
 
         if not self.username or not self.password:
@@ -146,6 +146,51 @@ class EmailNotificationSystem:
         try:
             from dashboard.notification_service import notification_service
 
+            # Try to fetch full threat data from database to get ensemble_confidence and description
+            threat_id = threat_data.get("threat_id") or threat_data.get("id")
+            confidence_score = threat_data.get("ensemble_confidence")
+            description = threat_data.get("description")
+
+            if threat_id and (not confidence_score or not description):
+                try:
+                    session = get_session()
+                    threat_result = (
+                        session.query(ThreatClassification, Vulnerability.description)
+                        .join(
+                            Vulnerability,
+                            ThreatClassification.vulnerability_id == Vulnerability.id,
+                        )
+                        .filter_by(id=threat_id)
+                        .first()
+                    )
+                    if threat_result:
+                        threat_obj, vuln_description = threat_result
+                        if not confidence_score:
+                            confidence_score = getattr(
+                                threat_obj, "ensemble_confidence", None
+                            )
+                        if not description and vuln_description:
+                            description = vuln_description
+                    session.close()
+                except Exception as db_err:
+                    print(f"[WARNING] Could not fetch threat details from DB: {db_err}")
+                    if session:
+                        session.close()
+
+            # Build confidence context
+            confidence_context = ""
+            if confidence_score is not None:
+                if confidence_score >= 0.70:
+                    confidence_context = (
+                        f"High confidence ({int(confidence_score*100)}%)"
+                    )
+                elif confidence_score >= 0.45:
+                    confidence_context = (
+                        f"Medium confidence ({int(confidence_score*100)}%)"
+                    )
+                else:
+                    confidence_context = f"Low confidence ({int(confidence_score*100)}%) - Verification needed"
+
             alert_data = {
                 "id": threat_data.get("id"),
                 "threat_type": threat_data.get("threat_type", "Unknown"),
@@ -153,7 +198,11 @@ class EmailNotificationSystem:
                 "risk_score": threat_data.get("risk_score", 0.0),
                 "asset_name": threat_data.get("asset_name", "N/A"),
                 "vulnerability_name": threat_data.get("vulnerability_name", "N/A"),
-                "description": threat_data.get("description", "No description"),
+                "description": description or "No description available",
+                "confidence_score": confidence_score,
+                "confidence_context": confidence_context,
+                "reviewed_by_analyst": threat_data.get("reviewed_by_analyst", False),
+                "analyst_name": threat_data.get("analyst_name"),
                 "dashboard_url": os.getenv("DASHBOARD_URL", "http://localhost:5000"),
             }
             notification_service.send_threat_alert(alert_data)
@@ -239,7 +288,7 @@ class EmailNotificationSystem:
         elif template_type == "escalation":
             subject = f"🔴 ESCALATED: {severity} Threat Requires Immediate Attention"
         elif template_type == "summary":
-            subject = f"📊 Threat Detection Summary - {datetime.now().strftime("%Y-%m-%d %H:%M")}"
+            subject = f"📊 Threat Detection Summary - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         else:
             subject = f"Threat Detection: {threat_type}"
 
@@ -401,19 +450,20 @@ class ResponseCoordinatorAgent:
     def __init__(
         self,
         agent_id: str = "response_001",
-        redis_host="localhost",
-        redis_port=6379,
+        redis_host=None,
+        redis_port=None,
         verbose: bool = True,
     ):
         self.agent_id = agent_id
+        redis_host = redis_host or os.getenv("REDIS_HOST", "localhost")
+        redis_port = int(
+            redis_port if redis_port is not None else os.getenv("REDIS_PORT", "6379")
+        )
         self.redis_client = redis.Redis(
             host=redis_host, port=redis_port, decode_responses=True
         )
 
-        # Initialize email notification system
-        # Uses Gmail SMTP with app password for sending alerts
-        # All emails are routed to demo_recipient (kurafn1337@gmail.com)
-        # but verbose output shows all analysts from the database
+        # Initialize email notification system with Gmail SMTP
         self.email_system = EmailNotificationSystem()
 
         # Response decision rules
@@ -479,49 +529,61 @@ class ResponseCoordinatorAgent:
         finally:
             session.close()
 
+        # Initialize OpenTelemetry tracing
+        self.tracer = trace.get_tracer(self.agent_id)
+        self.meter = metrics.get_meter(self.agent_id)
+        self.response_time = self.meter.create_histogram("response_latency_ms")
+        self.responses_coordinated = self.meter.create_counter("responses_executed")
+
     def process_hunting_results(self, hunting_results: Dict) -> Dict:
+        """Process hunting results: evaluate threats against rules, execute actions, notify analysts"""
+        with self.tracer.start_as_current_span("process_hunting_results") as span:
+            span.set_attribute("threats_count", len(hunting_results.get("threats", [])))
+            start = time.time()
 
-        response_report = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "agent_id": self.agent_id,
-            "threats_processed": len(hunting_results.get("threats", [])),
-            "actions_taken": [],
-            "emails_sent": [],
-            "errors": [],
-        }
+            response_report = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "agent_id": self.agent_id,
+                "threats_processed": len(hunting_results.get("threats", [])),
+                "actions_taken": [],
+                "emails_sent": [],
+                "errors": [],
+            }
 
-        # Process individual threats
-        for threat in hunting_results.get("threats", []):
-            try:
-                threat_response = self._process_single_threat(threat, hunting_results)
-                response_report["actions_taken"].extend(threat_response["actions"])
-                response_report["emails_sent"].extend(threat_response["emails"])
+            # Process individual threats
+            for threat in hunting_results.get("threats", []):
+                try:
+                    threat_response = self._process_single_threat(
+                        threat, hunting_results
+                    )
+                    response_report["actions_taken"].extend(threat_response["actions"])
+                    response_report["emails_sent"].extend(threat_response["emails"])
 
-            except Exception as e:
-                error_msg = (
-                    f"Failed to process threat {threat.get("threat_id")}: {str(e)}"
+                except Exception as e:
+                    error_msg = (
+                        f"Failed to process threat {threat.get('threat_id')}: {str(e)}"
+                    )
+                    response_report["errors"].append(error_msg)
+                    self.logger.error(f"{error_msg}")
+
+            # Process patterns and anomalies at system level
+            self._process_system_level_alerts(hunting_results, response_report)
+
+            # Log email summary
+            emails_sent = response_report.get("emails_sent", [])
+            if emails_sent:
+                successful = sum(1 for e in emails_sent if e.get("status") == "sent")
+                failed = len(emails_sent) - successful
+                self.logger.info(
+                    f" 📧 Email alerts sent to {successful} analyst(s)"
+                    f"{f' ({failed} failed)' if failed else ''}"
+                    f" — threat severity: {hunting_results.get('threats', [{}])[0].get('severity', 'Unknown')}"
                 )
-                response_report["errors"].append(error_msg)
-                self.logger.error(f"{error_msg}")
 
-        # Process patterns and anomalies at system level
-        self._process_system_level_alerts(hunting_results, response_report)
+            # Publish response report to message bus
+            self._publish_response_report(response_report)
 
-        # Log email summary
-        emails_sent = response_report.get("emails_sent", [])
-        if emails_sent:
-            successful = sum(1 for e in emails_sent if e.get("status") == "sent")
-            failed = len(emails_sent) - successful
-            self.logger.info(
-                f" 📧 Email alerts sent to {successful} analyst(s)"
-                f"{f' ({failed} failed)' if failed else ''}"
-                f" — threat severity: {hunting_results.get('threats', [{}])[0].get('severity', 'Unknown')}"
-            )
-
-        # Publish response report to message bus
-        self._publish_response_report(response_report)
-
-        return response_report
+            return response_report
 
     def _process_single_threat(self, threat: Dict, hunting_context: Dict) -> Dict:
         """Process individual threat and determine appropriate response."""
@@ -755,11 +817,11 @@ class ResponseCoordinatorAgent:
 
         if self.verbose:
             self.logger.debug(
-                f"CONTAINMENT: Containing threat {threat.get("asset_name")}"
+                f"CONTAINMENT: Containing threat {threat.get('asset_name')}"
             )
         else:
             self.logger.debug(
-                f"CONTAINMENT: Containing threat {threat.get("asset_name")}"
+                f"CONTAINMENT: Containing threat {threat.get('asset_name')}"
             )
 
         # Simulate containment success
@@ -768,9 +830,9 @@ class ResponseCoordinatorAgent:
     def _execute_isolation(self, threat: Dict) -> bool:
         """Execute isolation measures (placeholder - implement based on your infrastructure)"""
         if self.verbose:
-            self.logger.debug(f"ISOLATION: Isolating asset {threat.get("asset_name")}")
+            self.logger.debug(f"ISOLATION: Isolating asset {threat.get('asset_name')}")
         else:
-            self.logger.debug(f"ISOLATION: Isolating asset {threat.get("asset_name")}")
+            self.logger.debug(f"ISOLATION: Isolating asset {threat.get('asset_name')}")
 
         # Simulate isolation success
         return True
@@ -781,11 +843,11 @@ class ResponseCoordinatorAgent:
         ioc_matches = threat.get("ioc_matches", [])
         if ioc_matches and self.verbose:
             self.logger.debug(
-                f"BLOCKING: Blocking IOCs: {[ioc.get("value") for ioc in ioc_matches]}"
+                f"BLOCKING: Blocking IOCs: {[ioc.get('value') for ioc in ioc_matches]}"
             )
         elif ioc_matches and not self.verbose:
             self.logger.debug(
-                f"BLOCKING: Blocking IOCs: {[ioc.get("value") for ioc in ioc_matches]}"
+                f"BLOCKING: Blocking IOCs: {[ioc.get('value') for ioc in ioc_matches]}"
             )
 
         # Simulate blocking success
@@ -1092,6 +1154,7 @@ class ResponseCoordinatorAgent:
                 "threat_type": threat_type,
                 "asset_name": asset_name,
                 "vulnerability_name": vuln_name,
+                "ensemble_confidence": result.get("ensemble_confidence"),
                 "ioc_matches": result.get("ioc_matches", []),
                 "entity_correlations": correlated,
                 "ml_correlations": ml_correlated,

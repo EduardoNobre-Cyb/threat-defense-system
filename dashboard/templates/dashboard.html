@@ -1,0 +1,2080 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Threat Defense System - Dashboard</title>
+    <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet" type="text/css"/>
+    <script>
+      // Auth guard — runs before anything renders.
+      // If no token, redirect to login. If password change is required, redirect there first.
+      (function() {
+        if (!localStorage.getItem('auth_token')) {
+          window.location.replace('/login');
+        } else if (localStorage.getItem('must_change_password') === 'true') {
+          window.location.replace('/change-password');
+        }
+      })();
+    </script>
+    <script>
+      // authFetch must be defined in <head> so all inline body scripts can use it.
+      function authFetch(url, options = {}) {
+        const token = localStorage.getItem('auth_token');
+        options.headers = {
+          ...(options.headers || {}),
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        };
+        return fetch(url, options).then(res => {
+          // If the token has expired or been invalidated, send back to login
+          if (res.status === 401) {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_role');
+            localStorage.removeItem('user_name');
+            window.location.replace('/login');
+          }
+          return res;
+        });
+      }
+    </script>
+  </head>
+  <body>
+    <div class="header-container">
+      <h1>🛡️ Multi-Agent Threat Defense System</h1>
+      <div class="header-right">
+        <span class="user-greeting" id="user-greeting"></span>
+        <button class="logout-btn" onclick="logout()">⏻ Logout</button>
+        <div class="hamburger-menu">
+        <button class="hamburger-btn" onclick="toggleMenu()">☰</button>
+        <div class="dropdown-menu" id="dropdownMenu">
+          <div class="dropdown-item" onclick="showPage('dashboard-main')">Dashboard</div>
+          <div class="dropdown-item" onclick="showPage('agents')">Agent Management</div>
+          <div class="dropdown-item" onclick="showPage('database')">Database</div>
+          <div class="dropdown-item" onclick="showPage('logs-section')">Logs</div>
+          <div class="dropdown-item" id="menu-analyst-team" onclick="showPage('analyst-team-section')">Analyst Team</div>
+        </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Dashboard Page -->
+    <div id="dashboard-main" class="page-section active">
+      <h2>📊 Threat Monitoring Dashboard</h2>
+      
+      <div class="dashboard-grid">
+        <div class="dashboard-card">
+          <h3>📈 Import Information</h3>
+          <div id="import-info">
+            <p><strong>Last Log Ingestion:</strong> <span id="last-import">Loading...</span></p>
+            <p><strong>Total Log Events:</strong> <span id="total-logs">Loading...</span></p>
+            <p><strong>Assets Discovered:</strong> <span id="assets-count">Loading...</span></p>
+            <p><strong>Vulnerabilities Found:</strong> <span id="vulns-count">Loading...</span></p>
+          </div>
+        </div>
+
+        <div class="dashboard-card">
+          <h3>⚠️ Recent Threat Activity</h3>
+          
+          <!-- Threats list -->
+          <div id="threat-list"></div>
+          
+          <!-- Pagination controls (minimalist) -->
+          <div class="pagination-controls">
+            <span id="threats-page-info" class="pagination-info">1/0 (0 total)</span>
+            <div class="pagination-buttons">
+              <button id="btn-threats-prev" class="btn-pagination-prev">←</button>
+              <button id="btn-threats-next" class="btn-pagination-next">→</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="dashboard-card">
+          <h3>🚨 Detected Anomalies</h3>
+          <div id="anomalies-list">Loading...</div>
+        </div>
+
+        <div class="dashboard-card">
+          <h3>🎯 Attack Patterns Detected</h3>
+          <div id="patterns-list">Loading...</div>
+        </div>
+
+        <div class="dashboard-card" style="grid-column: 1 / -1;">
+          <h3>⛓️ Ranked Attack Paths</h3>
+          <div id="attack-paths-container">
+            <p class="text-muted">Loading...</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Threats Review Section -->
+      <section id="needs-review-section" style="margin-top:18px;" class="collapsed">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+          <div style="display:flex; align-items:center; gap:10px; cursor:pointer;" onclick="toggleReviewQueue()">
+            <span class="collapse-toggle" style="font-size:16px; transition:transform 0.2s; display:inline-block;">▼</span>
+            <h2 style="margin:0;">🔍 Threats Requiring Review</h2>
+          </div>
+          <button class="btn" onclick="openAnalyticsModal()">📊 View Analytics</button>
+        </div>
+        <div id="needs-review-container"><p>Loading review queue...</p></div>
+      </section>
+    </div>
+
+    <div id="review-modal", style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.82);
+    z-index:1000; align-items:center; justify-content:center;">
+      <div style="background:#0d1117; border:1px solid #00ff00; width:min(900px, 96vw); max-height:90vh; display:flex;
+      flex-direction:column; overflow:hidden;">
+        <div style="padding:10px 14px; border-bottom:1px solid #00ff00; display:flex; justify-content:space-between; align-items:center;">
+          <span>🧪 Review Threat</span>
+          <button onclick="closeReviewModal()" style="background:none; border:none; color:#00ff00; font-size:20px; cursor:pointer; padding:0; margin:0;">✕</button>
+        </div>
+        <div id="review-modal-body" style="padding:14px; overflow-y:auto;"></div>
+        <div style="padding:10px 14px; border-top:1px solid #00ff00; display:flex; gap:8px; justify-content:flex-end;">
+        </div>
+      </div>
+    </div>
+
+    <div id="analytics-modal" class="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7);
+    display:none; justify-content:center; align-items:center; z-index:1000;">
+      <div style="background:#111; border:1px solid #00ff00; border-radius:4px; padding:20px; max-width:900px; width:90%; max-height:80vh; overflow-y:auto;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+          <h3>📊 Team Analytics</h3>
+          <button onclick="closeAnalyticsModal()" style="background:none; border:none; color:#00ff00; font-size:20px; cursor:pointer;">✕</button>
+        </div>
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr style="border-bottom:2px solid #00ff00;">
+              <th style="padding:8px; text-align:left;">Analyst</th>
+              <th style="padding:8px; text-align:center;">Reviews</th>
+              <th style="padding:8px; text-align:center;">✓ Confirmed</th>
+              <th style="padding:8px; text-align:center;">🔴 False Pos.</th>
+              <th style="padding:8px; text-align:center;">⚠️ Escalated</th>
+              <th style="padding:8px; text-align:center;">⏱️ Avg Time</th>
+              <th style="padding:8px; text-align:center;">📈 SLA %</th>
+            </tr>
+          </thead>
+          <tbody id="analytics-body">
+            <tr>
+              <td colspan="7" style="text-align:center; padding:20px;">
+                Loading...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      let currentReviewThreatId = null; // Track which threat is being reviewed
+
+
+      async function loadNeedsReviewQueue() {
+        const container = document.getElementById("needs-review-container");
+        try {
+          const res = await authFetch("/api/reviews/pending");
+          const data = await res.json();
+
+          if (!data.items || data.items.length === 0) {
+            container.innerHTML = "<div class='no-data'>No pending reviews 🎉</div>";
+            return;
+          }
+
+          container.innerHTML = data.items
+            .map((item) => {
+              // Calculate SLA status
+              let slaClass = "sla-ok";
+              let slaLabel = "On Track";
+              if (item.sla_breached) {
+                slaClass = "sla-breached";
+                slaLabel = "❌ BREACHED";
+              } else if (item.sla_deadline) {
+                const now = new Date();
+                const deadline = new Date(item.sla_deadline);
+                const percentRemaining =
+                  ((deadline - now) / (deadline - new Date(item.created_at))) * 100;
+                if (percentRemaining < 20) {
+                  slaClass = "sla-critical";
+                  slaLabel = "🔴 Critical";
+                } else if (percentRemaining < 50) {
+                  slaClass = "sla-warning";
+                  slaLabel = "🟡 Warning";
+                }
+              }
+
+              // Lock status
+              let lockStatus = "";
+              if (item.locked_by && item.locked_by !== currentUserId) {
+                lockStatus = `<span style="color:#ff6b6b;">🔒 Locked by ${item.locked_analyst_name}</span>`;
+              }
+
+              return  `
+              <div class="threat-item" style="display:flex; justify-content:space-between;align-items:center;gap:12px;">
+                <div>
+                  <strong>${item.threat_type}</strong> - <span class="severity-${(item.severity || "low").toLowerCase()}">${item.severity}</span><br>
+                  <small>Risk: ${item.risk_score}/10 | ${item.asset_name} → ${item.vulnerability_name}</small>
+                </div>
+                <button class="btn" onclick="openReviewModal(${item.id})">Review</button>
+              </div>
+            `;
+          })
+              .join("");
+        } catch (e) {
+          container.innerHTML =
+          "<div class='no-data'>Failed to load review queue</div>";
+        }
+            
+     }
+
+     // Add CSS for SLA visual states
+     const style = document.createElement("style");
+     style.textContent = `
+     .threat-item.sla-ok { border-left-color: #00ff00; background: rgba(0,255,0,0.05); }
+     .threat-item.sla-warning { border-left-color: #ffaa00; background: rgba(255,170,0,0.1); }
+     .threat-item.sla-critical { border-left-color: #ff6b6b; background: rgba(255,107,107,0.1); }
+     .threat-item.sla-breached { border-left-color: #ff0000; background: rgba(255,0,0,0.15); }
+     `;
+     document.head.appendChild(style);
+
+    function closeReviewModal() {
+      // Unlock if not saved
+      if (currentReviewThreatId) {
+        authFetch(`/api/reviews/${currentReviewThreatId}/unlock`, { method: "POST",
+        });
+      }
+
+      document.getElementById("review-modal").style.display = "none";
+      currentReviewThreatId = null;
+    }
+
+    function toggleCustomThreatInput() {
+      const finalTypeSelect = document.getElementById("review-final-type");
+      const customInputContainer = document.getElementById("custom-threat-input-container");
+      
+      if (finalTypeSelect && customInputContainer) {
+        if (finalTypeSelect.value === "Other") {
+          customInputContainer.style.display = "block";
+        } else {
+          customInputContainer.style.display = "none";
+        }
+      }
+    }
+
+    async function openReviewModal(threatId) {
+      currentReviewThreatId = threatId;
+
+      // Try to claim - determine whether its need-review OR recent threat
+      let claimRes = await authFetch(`/api/reviews/${threatId}/claim`, { method: "POST" });
+      let claimData = await claimRes.json();
+
+      if (claimData.success) {
+        // Successfully claimed for review
+        // Lock it and loads need-review modal content
+        let lockRes = await authFetch(`/api/reviews/${threatId}/lock`, { method: "POST" });
+        let lockData = await lockRes.json();
+        if (!lockData.success) {
+          alert(lockData.message);
+          return;
+        }
+        await loadNeedsReviewModal(threatId);
+        updateModalButtons(false); // False = needs review workflow
+      } else {
+        // Failed to claim for review - its Recent threat
+        // Load recent-threat modal content
+        await loadRecentThreatReviewModal(threatId);
+        updateModalButtons(true); // True = recent threat workflow
+      }
+    }
+
+    async function loadNeedsReviewModal(threatId) {
+      const modal = document.getElementById("review-modal");
+      const body = document.getElementById("review-modal-body");
+      body.innerHTML = "Loading...";
+      modal.style.display = "flex";
+
+      const res = await authFetch(`/api/reviews/${threatId}`);
+      const data = await res.json();
+
+      // Calculate confidence level and percentage
+      const confidenceScore = data.ensemble_confidence || data.confidence_score || 0;
+      const confidencePercent = Math.round(confidenceScore * 100);
+      let confLevel = "low";
+      if (confidencePercent >= 70) confLevel = "high";
+      else if (confidencePercent >= 45) confLevel = "medium";
+
+      body.innerHTML = `
+        <p><strong>${data.threat_type}</strong> - <span class="severity-${data.severity.toLowerCase()}">${data.severity}</span></p>
+        <p>Risk: ${data.risk_score}/10 | <span class="threat-confidence-${confLevel}">Confidence: ${confidencePercent}%</span> | MITRE: ${data.mitre_tactic || "N/A"}</p>
+        <p>${data.asset_name} (${data.asset_type}) → ${data.vulnerability_name}</p>
+        <p>${data.vulnerability_description || ""}</p>
+
+        <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Final Classification</label>
+        <select id="review-final-type" onchange="toggleCustomThreatInput()" style="width:100%; margin-bottom:10px; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;">
+          <option value="">-- Select Classification --</option>
+          <option value="Injection Attack">Injection Attack</option>
+          <option value="Privilege Escalation">Privilege Escalation</option>
+          <option value="Data Exfiltration">Data Exfiltration</option>
+          <option value="Cross-Site Scripting">Cross-Site Scripting</option>
+          <option value="Denial of Service">Denial of Service</option>
+          <option value="Network Attack">Network Attack</option>
+          <option value="Vulnerability Exploit">Vulnerability Exploit</option>
+          <option value="Other">Other</option>
+        </select>
+
+        <div id="custom-threat-input-container" style="display:none; margin-bottom:10px;">
+          <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Custom Threat Type</label>
+          <input type="text" id="custom-threat-input" placeholder="Enter custom threat type..." style="width:100%; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; box-sizing:border-box;">
+        </div>
+
+        <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Analyst Notes</label>
+        <textarea id="review-notes" rows="5" style="width:100%; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; box-sizing:border-box;" placeholder="Add any relevant notes or context here..."></textarea>
+      `;
+    }
+
+    async function loadRecentThreatReviewModal(threatId) {
+      const modal = document.getElementById("review-modal");
+      const body = document.getElementById("review-modal-body");
+      body.innerHTML = "Loading...";
+      modal.style.display = "flex";
+
+      const res = await authFetch(`/api/reviews/${threatId}`);
+      const data = await res.json();
+
+      const confidenceScore = data.ensemble_confidence || data.confidence_score || 0;
+      const confidencePercent = Math.round(confidenceScore * 100);
+      let confLevel = "low";
+      if (confidencePercent >= 70) confLevel = "high";
+      else if (confidencePercent >= 45) confLevel = "medium";
+
+      body.innerHTML = `
+        <p><strong>${data.threat_type}</strong> - <span class="severity-${data.severity.toLowerCase()}">${data.severity}</span></p>
+        <p>Risk: ${data.risk_score}/10 | <span class="threat-confidence-${confLevel}">Confidence: ${confidencePercent}%</span> | MITRE: ${data.mitre_tactic || "N/A"}</p>
+        <p>${data.asset_name} (${data.asset_type}) → ${data.vulnerability_name}</p>
+        <p>${data.vulnerability_description || ""}</p>
+
+        <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Confirm or Change Classification</label>
+        <select id="review-final-type" onchange="toggleCustomThreatInput()" style="width:100%; margin-bottom:10px; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;">
+          <option value="${data.threat_type}" selected>✓ Keep: ${data.threat_type}</option>
+          <option value="">-- Change to --</option>
+          <option value="Remote Code Execution">Remote Code Execution</option>
+          <option value="Authentication Bypass">Authentication Bypass</option>
+          <option value="SQL Injection">SQL Injection</option>
+          <option value="Cross-Site Scripting">Cross-Site Scripting</option>
+          <option value="Path Traversal">Path Traversal</option>
+          <option value="Denial of Service">Denial of Service</option>
+          <option value="Privilege Escalation">Privilege Escalation</option>
+          <option value="Other">Other</option>
+        </select>
+
+        <div id="custom-threat-input-container" style="display:none; margin-bottom:10px;">
+          <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Custom Threat Type</label>
+          <input type="text" id="custom-threat-input" placeholder="Enter custom threat type..." style="width:100%; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; box-sizing:border-box;">
+        </div>
+
+        <label style="color:#00ff00; font-size:14px; display:block; margin-bottom:8px; margin-top:12px;">Notes (Optional)</label>
+        <textarea id="review-notes" rows="3" style="width:100%; background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; box-sizing:border-box;" placeholder="Why did you change it? (if changed)"></textarea>
+      `;
+    }
+
+    function updateModalButtons(isRecentThreat) {
+      const footer = document.querySelector("#review-modal > div > div:last-child");
+
+      if (isRecentThreat) {
+        footer.innerHTML = `
+          <button class="btn" onclick="submitRecentThreatReview('confirm')">✓ Confirm</button>
+          <button class="btn-review" onclick="submitRecentThreatReview('change')" style="margin-left:auto;">✎ Change</button>
+        `;
+      } else {
+        footer.innerHTML = `
+          <button class="btn" onclick="submitReviewDecision('confirm')">✓ Confirm</button>
+          <button class="btn-falsepositive" onclick="submitReviewDecision('false_positive')" style="margin-left:auto;">False Positive</button>
+          <button class="btn-escalate" onclick="submitReviewDecision('escalate')">Escalate</button>
+        `;
+      }
+    }
+
+    async function submitRecentThreatReview(action) {
+      if (!currentReviewThreatId) return;
+
+      const finalTypeSelect = document.getElementById("review-final-type");
+      let finalType = finalTypeSelect.value;
+      const notes = document.getElementById("review-notes").value.trim();
+
+      // If "Other" is selected, use the custom input value
+      if (finalType === "Other") {
+        finalType = (document.getElementById("custom-threat-input")?.value || "").trim();
+        if (!finalType) {
+          alert("Please enter a custom threat type.");
+          return;
+        }
+      }
+
+      // For change action, don't allow "-- Change to --" placeholder
+      if (action === "change" && finalType === "") {
+        alert("Please select a classification to change to.");
+        return;
+      }
+
+      const res = await authFetch(`/api/threats/${currentReviewThreatId}/review`, {
+        method: "PUT",
+        body: JSON.stringify({
+          threat_type: finalType,
+          analyst_notes: notes || `Analyst ${action} classification`,
+          reviewed_by_analyst: true,
+          action: action  // Pass action so backend can train models appropriately
+        }),
+      });
+      
+      const result = await res.json();
+      if (result.success) {
+        closeReviewModal();
+        await loadRecentThreats(); // Refresh the recent threats list to reflect any changes
+      } else {
+        alert(result.message || "Failed to submit review.");
+      }
+    }
+
+    async function submitReviewDecision(decision) {
+      if (!currentReviewThreatId) return;
+
+      const notes = (document.getElementById("review-notes")?.value || "").trim();
+      let finalThreatType = document.getElementById("review-final-type")?.value || "";
+
+      // If "Other" is selected, use the custom input value
+      if (finalThreatType === "Other") {
+        finalThreatType = (document.getElementById("custom-threat-input")?.value || "").trim();
+        if (!finalThreatType) {
+          alert("Please enter a custom threat type.");
+          return;
+        }
+      }
+
+      if (notes.length < 10) {
+        alert("Please provide review notes (minimum 10 characters).");
+        return;
+      }
+
+      if ((decision === "confirm" || decision === "escalate") && !finalThreatType) {
+        alert("Please select a final classification.");
+        return;
+      }
+
+      const res = await authFetch(
+        `/api/reviews/${currentReviewThreatId}/decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            decision,
+            final_threat_type: finalThreatType,
+            notes,
+          }),
+        },
+      );
+      const data = await res.json();
+
+      if (!data.success) {
+        alert(data.message || "Failed to submit review.");
+        return;
+      }
+
+      closeReviewModal();
+      await loadNeedsReviewQueue();
+      await loadRecentThreats(); // Refreshes card labels immediately
+    }
+
+    async function openAnalyticsModal() {
+      document.getElementById("analytics-modal").style.display = "flex";
+      await loadAnalyticsData();
+    }
+
+    function closeAnalyticsModal() {
+      document.getElementById("analytics-modal").style.display = "none";
+    }
+
+    async function loadAnalyticsData() {
+      const tbody = document.getElementById("analytics-body");
+      try {
+        const res = await authFetch("/api/analytics/reviewers");
+        const data = await res.json();
+
+        if (!data.items || data.items.length === 0) {
+          tbody.innerHTML =
+            `<tr><td colspan='7' style='text-align:center; padding:20px;'>No data yet. Reviews will appear
+            here as analysts submit decisions.</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = data.items
+        .map(
+          (a) => `
+          <tr style="border-bottom:1px solid #333;">
+            <td style="padding:8px;">${a.analyst_name}</td>
+            <td style="padding:8px; text-align:center;">${a.total_reviews}</td>
+            <td style="padding:8px; text-align:center; color:#00ff00;">${a.confirmed}</td>
+            <td style="padding:8px; text-align:center; color:#ffaa00;">${a.false_positives}</td>
+            <td style="padding:8px; text-align:center; color:#ff6b6b;">${a.escalated}</td>
+            <td style="padding:8px; text-align:center;">${a.avg_review_minutes} min</td>
+            <td style="padding:8px; text-align:center; color:${a.sla_compliance_pct >= 90 ?
+            "#00ff00" : a.sla_compliance_pct >= 70 ? "#ffaa00" : "#ff6b6b"};">${a.sla_compliance_pct}%</td>
+          </tr>
+          `,
+        )
+        .join("");
+      } catch (e) {
+        console.error(e);
+        tbody.innerHTML =
+          `<tr><td colspan='7' style='text-align:center; padding:20px; color:#ff6b6b'>Failed to load analytics data.</td></tr>`;
+      }
+    }
+
+    async function loadAttackPaths() {
+      try {
+        const response = await authFetch("/api/attack-paths");
+        const data = await response.json();
+
+        const container = document.getElementById("attack-paths-container");
+
+        if (!data.success || data.count === 0) {
+          container.innerHTML =`
+            <p class="text-muted">No attack paths found.</p>`;
+          return;
+        }
+
+        let html = `<table class="paths-table">
+          <tr>
+            <th>#</th>
+            <th>Attack Path(Source → Target)</th>
+            <th>Risk Score</th>
+            <th>Difficulty</th>
+            <th>Time (min)</th>
+            <th>Success %</th>
+            <th>Threat Actor</th>
+          </tr>`;
+
+        data.paths.forEach((path, idx) => {
+          // Color code risk score
+          let riskClass = "risk-low";
+          if (path.risk_score >= 7) riskClass = "risk-high";
+          else if (path.risk_score >= 4) riskClass = "risk-medium";
+
+          // Difficulty bar visualization (0-10 scale)
+          const diffPercent = (path.difficulty_score / 10) * 100;
+
+          html += `<tr>
+                    <td><strong>${idx + 1}</strong></td>
+                    <td><strong>${path.source}</strong> → <strong>${path.target}</strong></td>
+                    <td class="${riskClass}">${path.risk_score.toFixed(2)}</td>
+                    <td>
+                      <div class="difficulty-bar">
+                        <div class="difficulty-fill" style="width:${diffPercent}%;"></div>
+                      </div>
+                      ${path.difficulty_score.toFixed(1)}/10
+                    </td>
+                    <td>${path.time_to_exploit}</td>
+                    <td>${path.success_probability.toFixed(0)}%</td>
+                    <td>${path.actor_profile}</td>
+                  </tr>`;
+        });
+
+        html += `</table>`;
+        html += `<p class="text-muted mt-2">
+                <small>
+                  Showing top ${Math.min(10, data.count)} of ${data.count} paths.
+                  <strong>Higher risk</strong> = easier to exploit + higher impact.
+                  Focus defenses on high-risk paths first.
+                </small>
+              </p>`;
+        
+        container.innerHTML = html;
+      } catch (error) {
+        console.error("Error loading attack paths:", error);
+        document.getElementById("attack-paths-container").innerHTML =
+          `<p class="text-muted">❌ Error loading attack paths: ${error.message}</p>`;
+      }
+    }
+
+    // Load attack paths on initial dashboard load
+    document.addEventListener("DOMContentLoaded", function () {
+      loadAttackPaths();
+    });
+
+    // Close modal on ESC key
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeAnalyticsModal();
+    });
+
+    // Toggle review queue collapse
+    function toggleReviewQueue() {
+      const section = document.getElementById('needs-review-section');
+      section.classList.toggle('collapsed');
+      localStorage.setItem('review-queue-collapsed', section.classList.contains('collapsed'));
+    }
+
+    // Restore collapse state on load
+    window.addEventListener('DOMContentLoaded', () => {
+      if (localStorage.getItem('review-queue-collapsed') === 'true') {
+        document.getElementById('needs-review-section').classList.add('collapsed');
+      }
+    });
+
+    // Initialize on page load
+    loadNeedsReviewQueue();
+    setInterval(loadNeedsReviewQueue, 30000); // Refresh review queue every 30s
+    setInterval(loadAttackPaths, 30000); // Refresh attack paths every 30s
+    </script>
+
+
+    <!-- Agent Management Page -->
+    <div id="agents" class="page-section">
+      <h2>🤖 Agent Management</h2>
+      
+      <div class="agent-management-container" id="agent-status-container">
+        <!-- Agent cards are dynamically rendered by JavaScript -->
+      </div>
+
+      <script>
+        function fetchAgentStatus() {
+          authFetch("/api/agents/status")
+            .then((response) => response.json())
+            .then((data) => {
+              const container = document.getElementById("agent-status-container");
+              container.innerHTML = "";
+
+              data.agents.forEach((agent) => {
+                const isRunning = agent.status === "Running";
+                const card = document.createElement("div");
+                card.className = "agent-card-mgmt";
+
+                const statusClass = isRunning ? "status-running" : "status-stopped";
+                const statusText = agent.status;
+
+                let heartbeatHTML = "";
+                if (agent.last_heartbeat) {
+                  const hbTime = new Date(agent.last_heartbeat).toLocaleTimeString();
+                  heartbeatHTML = `<p class="agent-heartbeat">Last heartbeat: ${hbTime}</p>`;
+                } else {
+                  heartbeatHTML = `<p class="agent-heartbeat">No heartbeat received</p>`;
+                }
+
+                let buttonsHTML = "";
+                if (isRunning) {
+                  buttonsHTML = `
+                    <button class="btn btn-stop" onclick="agentAction('${agent.id}', 'stop')">Stop</button>
+                    <button class="btn btn-logs" onclick="openLogsModal('${agent.id}', '${agent.name}')">Logs</button>
+                  `;
+                } else {
+                  buttonsHTML = `
+                    <button class="btn btn-start" onclick="agentAction('${agent.id}', 'start')">Start</button>
+                    <button class="btn btn-logs" onclick="openLogsModal('${agent.id}', '${agent.name}')">Logs</button>
+                  `;
+                }
+
+                card.innerHTML = `
+                  <h3>Agent ${agent.agent_number} (${agent.name})</h3>
+                  <div class="agent-status">
+                    <span class="status-indicator ${statusClass}">●</span>
+                    <span class="status-text ${statusClass}">${statusText}</span>
+                  </div>
+                  ${heartbeatHTML}
+                  <div class="agent-controls">
+                    ${buttonsHTML}
+                  </div>
+                  <div id="model-review-${agent.id}" style="display:none; margin-top:10px;"></div>
+                `;
+                container.appendChild(card);
+
+                // Fetch pending models for Agent 2 and Agent 3
+                if (agent.id === "classifier_001" || agent.id === "hunter_001") {
+                  fetchPendingModelsForAgent(agent.id);
+                }
+              });
+            })
+            .catch((err) => {
+              console.error("Failed to fetch agent status:", err);
+              const container = document.getElementById("agent-status-container");
+              container.innerHTML = '<p class="no-data">Unable to fetch agent status</p>';
+            });
+        }
+
+        // Initial fetch + repeat every 5 seconds
+        fetchAgentStatus();
+        setInterval(fetchAgentStatus, 5000);
+
+        async function agentAction(agentId, action) {
+            // Disable the button immediatly to prevent double-clicks
+            event.target.disabled = true;
+            event.target.textContent = action === 'start' ? "Starting..." : "Stopping...";
+
+            try {
+              const response = await authFetch(`/api/agents/${agentId}/${action}`, { method: 'POST' });
+              const data = await response.json();
+
+              if (!response.ok) {
+                alert(`Error: ${data.error || "Unknown error"}`);
+              } else if (action === 'stop') {
+                // Refresh immediately so the button flips back without waiting for the next poll
+                fetchAgentStatus();
+              }
+              // Do nothing on success for start - the status will update on the next refresh cycle
+            } catch (err) {
+              alert(`Failed to ${action} agent: ${err.message}`);
+            }
+
+            // Re-enable button (the 5s poll will replace the card anyway)
+            event.target.disabled = false;
+        }
+
+        async function fetchPendingModelsForAgent(agentId) {
+          try {
+            const response = await fetch(
+              `/api/models?agent_id=${agentId}&status=pending`,
+            );
+            const data = await response.json();
+
+            if (data.status !== "success") {
+              console.error("Failed to fetch models:", data.message);
+              return;
+            }
+
+            const pendingModels = data.models;
+            const modelReviewSection = document.getElementById(
+              `model-review-${agentId}`,
+            );
+
+            // If no pending models, keep section hidden
+            if (!pendingModels || pendingModels.length === 0) {
+              modelReviewSection.style.display = "none";
+              return;
+            }
+
+            // Pending model exists - show section
+            modelReviewSection.style.display = "block";
+            const pendingModel = pendingModels[0];
+            
+            // Fetch active model for modal comparison
+            const activeResponse = await fetch(
+              `/api/models?agent_id=${agentId}&status=active`,
+            );
+            const activeData = await activeResponse.json();
+            const activeModel = activeData.models && activeData.models.length > 0 ? activeData.models[0] : null;
+
+            // Populate the notification
+            populateModelReviewNotification(
+              modelReviewSection,
+              agentId,
+              activeModel,
+              pendingModel,
+            );
+          } catch (error) {
+            console.error(`Error fetching models for ${agentId}:`, error);
+          }
+        }
+
+        function populateModelReviewNotification(section, agentId, activeModel, pendingModel) {
+          let html = `
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border-top: 1px solid #00ff00; margin-top: 10px;">
+              <div style="color: #00ff00; font-size: 12px; animation: pulse 1.5s infinite;">
+                ● New Model Pending: ${pendingModel.version}
+              </div>
+              <button onclick="showModelComparisonModal('${agentId}', ${pendingModel.id}, ${activeModel ? activeModel.id : "null"})"
+                      class="btn-review">
+                Review
+              </button>
+            </div>
+          `;
+
+          section.innerHTML = html;
+        }
+
+        function showModelComparisonModal(agentId, pendingModelId, activeModelId) {
+          // Create modal backdrop
+          let modal = document.getElementById(`model-comparison-modal-${agentId}`);
+          if (!modal) {
+            modal = document.createElement("div");
+            modal.id = `model-comparison-modal-${agentId}`;
+            modal.style.cssText = `
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              background-color: rgba(0, 0, 0, 0.8);
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              z-index: 10000;
+            `;
+            document.body.appendChild(modal);
+          }
+
+          // Populate modal with comparison table
+          modal.innerHTML = `
+            <div style="background-color: #1a1a1a; border: 2px solid #00ff00; padding: 20px; width: 80%; max-height: 80vh; overflow-y: auto; color: #00ff00; font-family: monospace; display: flex; flex-direction: column; position: relative;">
+              
+              <!-- Close Button (X) in Top Right -->
+              <button onclick="document.getElementById('model-comparison-modal-${agentId}').style.display='none'"
+                      style="position: absolute; top: 15px; right: 15px; background: none; border: none; color: #00ff00; font-size: 24px; cursor: pointer; padding: 0; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; hover: {opacity: 0.8;}">
+                ✕
+              </button>
+
+              <!-- Header -->
+              <div style="margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #00ff00; padding-right: 40px;">
+                <div style="font-size: 16px; font-weight: bold;">Model Comparison: ${agentId}</div>
+              </div>
+
+              <!-- Metrics Table -->
+              <div id="comparison-table-${agentId}" style="flex: 1; overflow-y: auto; margin-bottom: 15px;">
+                Loading comparison data...
+              </div>
+
+              <!-- Buttons: Approve (left) | Reject (right) -->
+              <div style="display: flex; justify-content: flex-start; gap: 20px; padding-top: 15px; border-top: 1px solid #00ff00;">
+                <button onclick="approveModel(${pendingModelId}, '${agentId}')"
+                        class="btn-approve"
+                        style="flex: 0 0 auto;">
+                  ✓ Approve
+                </button>
+                <button onclick="rejectModel(${pendingModelId}, '${agentId}')"
+                        class="btn-reject"
+                        style="margin-left: auto; flex: 0 0 auto;">
+                  ✕ Reject
+                </button>
+              </div>
+            </div>
+          `;
+
+          modal.style.display = "flex";
+
+          // Fetch and populate comparison table
+          Promise.all([
+            fetch(`/api/models/${pendingModelId}`).then((r) => r.json()),
+            activeModelId
+              ? fetch(`/api/models/${activeModelId}`).then((r) => r.json())
+              : Promise.resolve({ model: null }),
+          ])
+            .then(([pendingData, activeData]) => {
+              const pendingModel = pendingData.model;
+              const activeModel = activeData.model;
+
+              let tableHTML = `
+              <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                <tr style="background-color: rgba(0, 255, 0, 0.1); border-bottom: 1px solid #00ff00;">
+                  <th style="padding: 8px; text-align: left; color: #00ff00;">Metric</th>
+                  <th style="padding: 8px; text-align: left; color: #888;">${activeModel ? "Current" : "N/A"}</th>
+                  <th style="padding: 8px; text-align: left; color: #00ff00; font-weight: bold;">New</th>
+                  <th style="padding: 8px; text-align: center; color: #ffff00;">Change</th>
+                </tr>
+            `;
+                const formatMetric = (value) => {
+                  if (typeof value === "number" && value < 1)
+                    return (value * 100).toFixed(1) + "%";
+                  return value ? value.toFixed(2) : "N/A";
+                };
+
+                const diff = (newVal, oldVal) => {
+                  if (!oldVal || typeof newVal !== "number" || typeof oldVal !== "number")
+                    return "—";
+                  const change = ((newVal - oldVal) * 100).toFixed(1);
+                  const color = change > 0 ? "#00ff00" : change < 0 ? "#ff0000" : "#888";
+                  return `<span style="color: ${color};">${change > 0 ? "+" : ""}${change}%</span>`;
+                }
+
+                // Core metrics
+                const metrics = [
+                  { label: "Accuracy", key: "accuracy" },
+                  { label: "Macro F1", key: "macro_f1" },
+                  { label: "Training Duration (s)", key: "training_duration_seconds" },
+                ];
+
+                metrics.forEach((metric) => {
+                  const newVal = pendingModel[metric.key];
+                  const oldVal = activeModel ? activeModel[metric.key] : null;
+                  tableHTML += `
+                  <tr style="border-bottom: 1px solid #333;">
+                    <td style="padding: 8px; color: #00ff00; font-weight: bold;">${metric.label}</td>
+                    <td style="padding: 8px; color: #888;">${oldVal !== null ? formatMetric(oldVal) : "N/A"}</td>
+                    <td style="padding: 8px; color: #00ff00;">${formatMetric(newVal)}</td>
+                    <td style="padding: 8px; text-align: center;">${diff(newVal, oldVal)}</td>
+                  </tr>
+                `;
+                });
+
+                // Per-class recalls
+                if (pendingModel.recall_per_class) {
+                  tableHTML += `
+                  <tr style="background-color: rgba(0, 255, 0, 0.1); border-bottom: 1px solid #00ff00;">
+                    <td colspan="4" style="padding: 8px; color: #00ff00; font-weight: bold;">Per-Class Recall</td>
+                  </tr>
+                `;
+
+                  for (const [threat, recall] of Object.entries(
+                    pendingModel.recall_per_class,
+                  )) {
+                    const oldRecall = activeModel?.recall_per_class?.[threat] || null;
+                    tableHTML += `
+                    <tr style="border-bottom: 1px solid #333;">
+                      <td style="padding: 8px; color: #888;">└─ ${threat}</td>
+                      <td style="padding: 8px; color: #888;">${oldRecall ? formatMetric(oldRecall) : "N/A"}</td>
+                      <td style="padding: 8px; color: #00ff00;">${formatMetric(recall)}</td>
+                      <td style="padding: 8px; text-align: center;">${diff(recall, oldRecall)}</td>
+                    </tr>
+                  `;
+                  }
+                }
+
+                tableHTML += `</table>`;
+                document.getElementById(`comparison-table-${agentId}`).innerHTML =
+                  tableHTML;
+            })
+            .catch((error) => {
+              console.error("Error loading comparison:", error);
+              document.getElementById(`comparison-table-${agentId}`).innerHTML =
+                `<div style="color: #ff0000;">Error loading comparison data</div>`;
+            });
+        }
+
+        async function approveModel(modelId, agentId) {
+          if (!confirm("Approve this model?")) return;
+
+          try {
+            const response = await fetch(`/api/models/${modelId}/approve`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                analyst_id: getCurrentAnalystId(),
+                notes: "Approved via dashboard",
+              }),
+            });
+
+            const data = await response.json();
+            if (data.status === "success") {
+              // Modal approved - now show deployment confirmation modal
+              showDeploymentConfirmationModal(modelId, agentId);
+            } else {
+              alert(`Error: ${data.message}`);
+            }
+          } catch (error) {
+            console.error("Error approving:", error);
+            alert("Error approving model");
+          }
+        }
+
+        function showDeploymentConfirmationModal(modelId, agentId) {
+          // Create modal backdrop
+          let deployModal = document.getElementById(
+            `deploy-confirmation-modal-${agentId}`,
+          );
+          if (!deployModal) {
+            deployModal = document.createElement("div");
+            deployModal.id = `deploy-confirmation-modal-${agentId}`;
+            document.body.appendChild(deployModal);
+          }
+
+          deployModal.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10001;
+          `;
+
+          deployModal.innerHTML = `
+            <div style="background-color: #1a1a1a; border: 2px solid #00ff00; padding: 30px; width: 500px; color: #00ff00; font-family: monospace; display: flex; flex-direction: column; gap: 15px; border-radius: 5px;">
+              
+              <!-- Header -->
+              <div style="font-size: 18px; font-weight: bold; border-bottom: 1px solid #00ff00; padding-bottom: 10px;">
+                🚀 Deploy Model
+              </div>
+
+              <!-- Message -->
+              <div style="font-size: 13px; line-height: 1.6;">
+                Model has been <span style="color: #00ff00; font-weight: bold;">✅ APPROVED</span> successfully!
+                <br><br>
+                Would you like to <span style="color: #ffff00;">deploy</span> this model now?
+                <br><br>
+                <span style="color: #888; font-size: 11px;">
+                  (This will immediately switch agents to use the new model)
+                </span>
+              </div>
+
+              <!-- Buttons: Deploy (green) | Cancel (red) -->
+              <div style="display: flex; gap: 10px; justify-content: flex-end; padding-top: 10px; border-top: 1px solid #00ff00;">
+                <button 
+                  onclick="closeDeploymentConfirmation('${agentId}')"
+                  style="padding: 10px 20px; background-color: #333; color: #ff0000; border: 1px solid #ff0000; cursor: pointer; font-weight: bold; border-radius: 3px; font-family: monospace; font-size: 12px;">
+                  Cancel
+                </button>
+                <button 
+                  onclick="deployModelNow(${modelId}, '${agentId}')"
+                  style="padding: 10px 20px; background-color: #00ff00; color: #000; border: none; cursor: pointer; font-weight: bold; border-radius: 3px; font-family: monospace; font-size: 12px;">
+                  Deploy Now
+                </button>
+              </div>
+            </div>
+          `;
+
+          deployModal.style.display = "flex";
+        }
+
+        function closeDeploymentConfirmation(agentId) {
+          const deployModal = document.getElementById(
+            `deploy-confirmation-modal-${agentId}`,
+          );
+          if (deployModal) {
+            deployModal.style.display = "none";
+          }
+
+          const comparisonModal = document.getElementById(
+            `model-comparison-modal-${agentId}`,
+          );
+          if (comparisonModal) {
+            comparisonModal.style.display = "none";
+          }
+
+          fetchAgentStatus(); // Refresh cards
+        }
+
+        async function deployModelNow(modelId, agentId) {
+          try {
+            const response = await fetch(`/api/models/${modelId}/deploy`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                analyst_id: getCurrentAnalystId(),
+              }),
+            });
+
+            const data = await response.json();
+            if (data.status === "success") {
+              // Show success message in modal
+              const deployModal = document.getElementById(
+                `deploy-confirmation-modal-${agentId}`,
+              );
+              deployModal.innerHTML = `
+                <div style="background-color: #1a1a1a; border: 2px solid #00ff00; padding: 30px; width: 500px; color: #00ff00; font-family: monospace; text-align: center; border-radius: 5px;">
+                  <div style="font-size: 24px; margin-bottom: 15px;">✅</div>
+                  <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px;">Model Deployed Successfully!</div>
+                  <div style="font-size: 12px; color: #888; margin-bottom: 20px;">
+                    Agents are now using the new model.
+                    <br><br>
+                    <span style="color: #00ff00;">Next inference will use updated model</span>
+                  </div>
+                  <button 
+                    onclick="closeDeploymentConfirmation('${agentId}')"
+                    style="padding: 10px 30px; background-color: #00ff00; color: #000; border: none; cursor: pointer; font-weight: bold; border-radius: 3px; font-family: monospace; font-size: 12px;">
+                    Close
+                  </button>
+                </div>
+              `;
+
+              // Auto-close after 3 seconds
+              setTimeout(() => {
+                closeDeploymentConfirmation(agentId);
+              }, 3000);
+            } else {
+              // Show error in modal
+              const deployModal = document.getElementById(
+                `deploy-confirmation-modal-${agentId}`,
+              );
+              deployModal.innerHTML = `
+                <div style="background-color: #1a1a1a; border: 2px solid #ff0000; padding: 30px; width: 500px; color: #ff0000; font-family: monospace; text-align: center; border-radius: 5px;">
+                  <div style="font-size: 24px; margin-bottom: 15px;">❌</div>
+                  <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px;">Deployment Failed</div>
+                  <div style="font-size: 12px; margin-bottom: 20px;">
+                    ${data.message || "Unknown error"}
+                  </div>
+                  <button 
+                    onclick="closeDeploymentConfirmation('${agentId}')"
+                    style="padding: 10px 30px; background-color: #ff0000; color: #000; border: none; cursor: pointer; font-weight: bold; border-radius: 3px; font-family: monospace; font-size: 12px;">
+                    Close
+                  </button>
+                </div>
+              `;
+            }
+          } catch (error) {
+            console.error("Error deploying:", error);
+            const deployModal = document.getElementById(
+              `deploy-confirmation-modal-${agentId}`,
+            );
+            deployModal.innerHTML = `
+              <div style="background-color: #1a1a1a; border: 2px solid #ff0000; padding: 30px; width: 500px; color: #ff0000; font-family: monospace; text-align: center; border-radius: 5px;">
+                <div style="font-size: 24px; margin-bottom: 15px;">❌</div>
+                <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px;">Error</div>
+                <div style="font-size: 12px; margin-bottom: 20px;">
+                  ${error.message || "Failed to deploy model"}
+                </div>
+                <button 
+                  onclick="closeDeploymentConfirmation('${agentId}')"
+                  style="padding: 10px 30px; background-color: #ff0000; color: #000; border: none; cursor: pointer; font-weight: bold; border-radius: 3px; font-family: monospace; font-size: 12px;">
+                  Close
+                </button>
+              </div>
+            `;
+          }
+        }
+
+        async function rejectModel(modelId, agentId) {
+          if (!confirm("Reject this model?")) return;
+
+          try {
+            const response = await fetch(`/api/models/${modelId}/reject`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                analyst_id: getCurrentAnalystId(),
+                reason: "Rejected via dashboard",
+              }),
+            });
+
+            const data = await response.json();
+            if (data.status === "success") {
+              alert("✅ Model rejected!");
+              document.getElementById(
+                `model-comparison-modal-${agentId}`,
+              ).style.display = "none";
+              
+              // Refresh agent status and pending models
+              fetchAgentStatus();
+              
+              // Also explicitly refresh pending models after a brief delay
+              setTimeout(() => {
+                fetchPendingModelsForAgent(agentId);
+              }, 500);
+            } else {
+              alert(`Error: ${data.message}`);
+            }
+          } catch (error) {
+            console.error("Error rejecting:", error);
+            alert("Error rejecting model");
+          }
+        }
+
+        function decodeJWT(token) {
+          try {
+            const base64Url = token.split('.')[1];
+            const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+            const jsonPayload = decodeURIComponent(atob(base64).split('').map((c) => {
+              return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+            }).join(''));
+            return JSON.parse(jsonPayload);
+          } catch (error) {
+            console.error("Error decoding JWT:", error);
+            return null;
+          }
+        }
+
+        function getCurrentAnalystId() {
+          const id = sessionStorage.getItem("analyst_id");
+          if (id) {
+            return parseInt(id, 10);
+          }
+          
+          // Try to extract from JWT token
+          const token = localStorage.getItem("auth_token");
+          if (token) {
+            const decoded = decodeJWT(token);
+            if (decoded && decoded.sub) {
+              const analyst_id = parseInt(decoded.sub, 10);
+              sessionStorage.setItem("analyst_id", analyst_id.toString());
+              return analyst_id;
+            }
+          }
+          
+          // No analyst_id available
+          console.error("No analyst_id found in token or storage");
+          return null;
+        }
+
+        async function initializeCurrentUser() {
+          try {
+            const response = await fetch("/api/auth/me");
+            if (response.ok) {
+              const data = await response.json();
+              if (data.analyst_id) {
+                sessionStorage.setItem("analyst_id", data.analyst_id.toString());
+              }
+            } else {
+              // Fallback: try to extract from JWT token
+              const token = localStorage.getItem("auth_token");
+              if (token) {
+                const decoded = decodeJWT(token);
+                if (decoded && decoded.sub) {
+                  sessionStorage.setItem("analyst_id", decoded.sub);
+                }
+              }
+            }
+          } catch (error) {
+            console.error("Error fetching current user:", error);
+          }
+        }
+
+        // Initialize when DOM is ready
+        document.addEventListener("DOMContentLoaded", initializeCurrentUser);
+      </script>
+    </div>
+
+    <!-- Database Page -->
+    <div id="database" class="page-section database-section">
+      <h2>📊 Database Overview</h2>
+
+      <h3>Assets</h3>
+      <table id="assets-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Risk Level</th>
+          </tr>
+        </thead>
+        <tbody id="assets-body"></tbody>
+      </table>
+
+      <h3>Vulnerabilities</h3>
+      <table id="vulnerabilities-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Severity</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody id="vulnerabilities-body"></tbody>
+      </table>
+
+      <h3>Asset-Vulnerability Mappings</h3>
+      <table id="asset-vulns-table">
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th>Type</th>
+            <th>Risk Level</th>
+            <th>Vulnerability</th>
+            <th>Severity</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody id="asset-vulns-body"></tbody>
+      </table>
+    </div>
+
+    <script>
+      // Fetch import/log statistics for dashboard
+      function loadDashboardStats() {
+        authFetch("/api/logs")
+          .then((r) => r.json())
+          .then((data) => {
+            document.getElementById("total-logs").textContent = data.logs.length;
+            if (data.logs.length > 0) {
+              const lastLog = data.logs[0];
+              document.getElementById("last-import").textContent = 
+                new Date(lastLog.timestamp).toLocaleString();
+            }
+          })
+          .catch(() => {
+            document.getElementById("total-logs").textContent = "0";
+            document.getElementById("last-import").textContent = "Never";
+          });
+
+        authFetch("/api/assets")
+          .then((r) => r.json())
+          .then((data) => {
+            document.getElementById("assets-count").textContent = data.assets.length;
+          })
+          .catch(() => {
+            document.getElementById("assets-count").textContent = "0";
+          });
+
+        authFetch("/api/vulnerabilities")
+          .then((r) => r.json())
+          .then((data) => {
+            document.getElementById("vulns-count").textContent = data.vulnerabilities.length;
+          })
+          .catch(() => {
+            document.getElementById("vulns-count").textContent = "0";
+          });
+      }
+
+      // Determine color/styling based on confidence
+      function confidenceLevel(score) {
+        if (score >= 0.7) return "high";
+        if (score >= 0.45) return "medium";
+        return "low";
+      }
+
+      let currentPage = 1;
+      const pageSize = 20;
+
+      // Fetch recent threats for main dashboard
+      function loadRecentThreats(page = 1) {
+        currentPage = page;
+        const url = `/api/threats/recent?page=${currentPage}&page_size=${pageSize}`;
+        
+        authFetch(url)
+          .then((r) => r.json())
+          .then((data) => {
+            const list = document.getElementById("threat-list");
+            if (data.threats && data.threats.length > 0) {
+              list.innerHTML = '';
+              data.threats.forEach((threat) => {
+                const confLevel = confidenceLevel(threat.confidence_score || 0);
+                const confPercent = Math.round((threat.confidence_score || 0) * 100);
+                
+                // Build analyst badge if reviewed
+                let analystBadgeHTML = '';
+                if (threat.reviewed_by_analyst && threat.reviewed_by_name) {
+                  analystBadgeHTML = `
+                    <span class="analyst-badge">
+                      <span class="analyst-badge-icon">👤</span>
+                      <span class="analyst-name">${threat.reviewed_by_name}</span>
+                    </span>
+                  `;
+                }
+                
+                // Build review button for medium confidence
+                let reviewButtonHTML = '';
+                if (threat.confidence_score > 0.45 && threat.confidence_score < 0.70 && !threat.reviewed_by_analyst) {
+                  reviewButtonHTML = `
+                    <button class="btn-review" onclick="openReviewModal(${threat.id})">Review</button>
+                  `;
+                }
+                
+                list.innerHTML += `
+                  <div class="threat-item">
+                    <div class="threat-header">
+                      <span class="threat-type">${threat.threat_type}</span>
+                    </div>
+                    
+                    <div class="threat-details">
+                      <span class="threat-severity severity-${threat.severity.toLowerCase()}">${threat.severity}</span>
+                      <span class="threat-risk">Risk: ${threat.risk_score}/10</span>
+                      
+                      <span class="threat-confidence threat-confidence-${confLevel}">
+                        ${confPercent}%
+                      </span>
+                      
+                      ${analystBadgeHTML}
+                      
+                      ${reviewButtonHTML}
+                    </div>
+                    
+                    <div class="threat-info">
+                      ${threat.asset_name} → ${threat.vulnerability_name}
+                    </div>
+                  </div>
+                `;
+              });
+            } else {
+              list.innerHTML = '<div class="no-data">No recent threat activity</div>';
+            }
+            
+            // Handle pagination metadata from response
+            if (data.pagination) {
+              updatePaginationControls(data.pagination);
+            }
+          })
+          .catch(() => {
+            document.getElementById("threat-list").innerHTML =
+              '<div class="no-data">No recent threat activity</div>';
+          });
+      }
+
+      // Update pagination controls based on API response
+      function updatePaginationControls(pagination) {
+        const pageInfo = document.getElementById("threats-page-info");
+        const prevBtn = document.getElementById("btn-threats-prev");
+        const nextBtn = document.getElementById("btn-threats-next");
+        
+        if (pageInfo) {
+          pageInfo.textContent = `${pagination.page}/${pagination.total_pages} (${pagination.total_count} total)`;
+        }
+        
+        if (prevBtn) {
+          prevBtn.disabled = false;
+          prevBtn.onclick = () => {
+            if (pagination.has_prev) {
+              loadRecentThreats(pagination.page - 1);
+            }
+          };
+        }
+        
+        if (nextBtn) {
+          nextBtn.disabled = false;
+          nextBtn.onclick = () => {
+            if (pagination.has_next) {
+              loadRecentThreats(pagination.page + 1);
+            }
+          };
+        }
+      }
+
+      // Load threats on page init
+      document.addEventListener('DOMContentLoaded', () => {
+        loadRecentThreats(1);  // Start at page 1
+      });
+
+      // Fetch detected anomalies
+      function loadAnomalies() {
+        authFetch("/api/anomalies")
+          .then((r) => r.json())
+          .then((data) => {
+            const list = document.getElementById("anomalies-list");
+            if (data.anomalies && data.anomalies.length > 0) {
+              list.innerHTML = '';
+              data.anomalies.forEach((anomaly) => {
+                list.innerHTML += `
+                  <div class="anomaly-item">
+                    <strong>🚨 ${anomaly.threat_type}</strong><br>
+                    <small>Score: ${anomaly.anomaly_score.toFixed(2)} | ${anomaly.reasons.join(', ')}</small>
+                  </div>
+                `;
+              });
+            } else {
+              list.innerHTML = '<div class="no-data">No anomalies detected</div>';
+            }
+          })
+          .catch(() => {
+            document.getElementById("anomalies-list").innerHTML =
+              '<div class="no-data">No anomalies detected</div>';
+          });
+      }
+
+      // Fetch attack patterns
+      function loadPatterns() {
+        authFetch("/api/patterns")
+          .then((r) => r.json())
+          .then((data) => {
+            const list = document.getElementById("patterns-list");
+            if (data.patterns && data.patterns.length > 0) {
+              list.innerHTML = '';
+              data.patterns.forEach((pattern) => {
+                list.innerHTML += `
+                  <div class="pattern-item">
+                    <strong>🎯 ${pattern.pattern}</strong><br>
+                    <small>Confidence: ${pattern.confidence.toFixed(2)} | ${pattern.description}</small>
+                  </div>
+                `;
+              });
+            } else {
+              list.innerHTML = '<div class="no-data">No attack patterns detected</div>';
+            }
+          })
+          .catch(() => {
+            document.getElementById("patterns-list").innerHTML =
+              '<div class="no-data">No attack patterns detected</div>';
+          });
+      }
+
+      // Load all dashboard data
+      function loadDashboard() {
+        loadDashboardStats();
+        loadRecentThreats();
+        loadAnomalies();
+        loadPatterns();
+      }
+
+      // Initialize dashboard
+      loadDashboard();
+      
+      // Refresh data every 30 seconds
+      setInterval(loadDashboard, 30000);
+
+      // Fetch assets
+      authFetch("/api/assets")
+        .then((r) => r.json())
+        .then((data) => {
+          const tbody = document.getElementById("assets-body");
+          data.assets.forEach((asset) => {
+            const riskClass = `criticality-${asset.risk_level.toLowerCase()}`;
+            tbody.innerHTML += `
+                        <tr>
+                            <td>${asset.id}</td>
+                            <td>${asset.name}</td>
+                            <td>${asset.type}</td>
+                            <td class="${riskClass}">${asset.risk_level}</td>
+                        </tr>
+                    `;
+          });
+        });
+
+      // Fetch vulnerabilities
+      authFetch("/api/vulnerabilities")
+        .then((r) => r.json())
+        .then((data) => {
+          const tbody = document.getElementById("vulnerabilities-body");
+          data.vulnerabilities.forEach((vuln) => {
+            const severityClass = `severity-${vuln.severity.toLowerCase()}`;
+            tbody.innerHTML += `
+                        <tr>
+                            <td>${vuln.id}</td>
+                            <td>${vuln.name}</td>
+                            <td class="${severityClass}">${vuln.severity}</td>
+                            <td>${vuln.description || "N/A"}</td>
+                        </tr>
+                    `;
+          });
+        });
+
+      // Fetch asset-vulnerability mappings
+      authFetch("/api/asset-vulnerabilities")
+        .then((r) => r.json())
+        .then((data) => {
+          const tbody = document.getElementById("asset-vulns-body");
+          data.asset_vulnerabilities.forEach((link) => {
+            const severityClass = `severity-${link.severity.toLowerCase()}`;
+            const riskClass = `criticality-${link.risk_level.toLowerCase()}`;
+            tbody.innerHTML += `
+                        <tr>
+                            <td>${link.asset_name}</td>
+                            <td>${link.asset_type}</td>
+                            <td class="${riskClass}">${link.risk_level}</td>
+                            <td>${link.vulnerability_name}</td>
+                            <td class="${severityClass}">${link.severity}</td>
+                            <td>${link.description || "N/A"}</td>
+                        </tr>
+                    `;
+          });
+        });
+      
+      // Hamburger menu toggle
+      function toggleMenu() {
+        const menu = document.getElementById('dropdownMenu');
+        menu.classList.toggle('show');
+      }
+      
+      // Show specific page/section
+      function showPage(pageId) {
+        // Hide all pages
+        document.querySelectorAll('.page-section').forEach(page => {
+          page.classList.remove('active');
+        });
+        
+        // Show selected page
+        const selectedPage = document.getElementById(pageId);
+        if (selectedPage) {
+          selectedPage.classList.add('active');
+        }
+        
+        // Close dropdown
+        document.getElementById('dropdownMenu').classList.remove('show');
+      }
+      
+      // Close dropdown when clicking outside
+      window.addEventListener('click', function(e) {
+        if (!e.target.matches('.hamburger-btn')) {
+          const dropdown = document.getElementById('dropdownMenu');
+          if (dropdown && dropdown.classList.contains('show')) {
+            dropdown.classList.remove('show');
+          }
+        }
+      });
+    </script>
+
+    <!-- Logs Section -->
+    <section id="logs-section" class="page-section">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>📄 Recent Ingested Logs</h2>
+        <div>
+          <input
+            type="file"
+            id="log-file-input"
+            accept=".json,.csv,.log,.txt"
+            style="display:none;"
+            onchange="handleLogUpload(this)"
+          />
+          <button
+            class="btn"
+            onclick="document.getElementById('log-file-input').click()"
+          >
+            📁 Upload Log File
+          </button>
+        </div>
+      </div>
+      <div
+        id="upload-status"
+        style="display:none; margin:10px 0; padding:10px; border-radius:3px; font-size:12px;"
+      ></div>
+      <div id="logs-container">
+        <p>Loading logs...</p>
+      </div>
+    </section>
+
+    <!-- Analyst Team Section -->
+    <section id="analyst-team-section" class="page-section">
+      <h2>👥 Analyst Team Management</h2>
+      <div id="analysts-container">
+        <p>Loading analysts...</p>
+      </div>
+    </section>
+
+    <!-- Agent Log Terminal Modal -->
+    <div id="agent-logs-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.82); z-index:1000; align-items:center; justify-content:center;">
+      <div style="background:#000; border:1.5px solid #00ff00; border-radius:6px; width:min(1200px,96vw); max-height:90vh; display:flex; flex-direction:column; font-family:'Share Tech Mono','Courier New',monospace; overflow:hidden;">
+
+        <!-- Title bar -->
+        <div style="display:flex; align-items:center; background:#0d0d0d; border-bottom:1px solid #00ff00; padding:8px 14px; gap:8px;">
+          <span style="width:11px;height:11px;border-radius:50%;background:#ff5f57;display:inline-block;"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#febc2e;display:inline-block;"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#28c840;display:inline-block;"></span>
+          <span id="logs-modal-title" style="flex:1; text-align:center; color:#00ff00; font-size:12px;"></span>
+          <span id="logs-live-indicator" style="color:#00ff00; font-size:10px; animation: pulse 1.5s infinite;">● LIVE</span>
+          <button onclick="closeLogsModal()" style="background:transparent; border:none; color:#00ff00; font-size:18px; cursor:pointer; line-height:1; padding:0 4px;">&times;</button>
+        </div>
+
+        <!-- Log body -->
+        <div id="logs-modal-body" style="flex:1; overflow-y:auto; padding:14px 18px; font-size:13.5px; line-height:1.75; color:#00ff00; white-space:pre-wrap; word-break:break-all; min-height:400px;">
+          <span style="color:#555;">Loading&hellip;</span>
+        </div>
+
+        <!-- Footer -->
+        <div style="display:flex; justify-content:space-between; align-items:center; background:#0d0d0d; border-top:1px solid #00ff00; padding:5px 14px;">
+          <span id="logs-modal-linecount" style="color:#00aa00; font-size:10px;"></span>
+          <button onclick="document.getElementById('logs-modal-body').scrollTop=9999999" style="background:transparent; border:none; color:#00aa00; font-size:10px; cursor:pointer; font-family:'Share Tech Mono','Courier New',monospace;">&darr; scroll to end</button>
+        </div>
+
+      </div>
+    </div>
+
+    <script>
+      async function handleLogUpload(input) {
+        const file = input.files[0];
+        if (!file) return;
+
+        const statusDiv = document.getElementById("upload-status");
+
+        // Show uploading state
+        statusDiv.style.display = "block";
+        statusDiv.style.background = "#1a1f3a";
+        statusDiv.style.border = "1px solid #00ff00";
+        statusDiv.style.color = "#00ff00";
+        statusDiv.textContent = `Uploading ${file.name}...`;
+
+        // Build FormData (this is how you send files via fetch)
+        const formData = new FormData();
+        formData.append("logfile", file); // 'logfile' must match request.files["logfile"] in Flask
+
+        try {
+          const token = localStorage.getItem("auth_token");
+          const response = await fetch("/upload_log", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              // Do NOT set Content-Type — browser sets it automatically for FormData
+            },
+            body: formData,
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            statusDiv.style.borderColor = "#00ff00";
+            statusDiv.style.color = "#00ff00";
+            statusDiv.textContent = `✅ ${data.message}`;
+            // Refresh the logs list to show the newly ingested data
+            loadLogs();
+          } else {
+            statusDiv.style.borderColor = "#ff4444";
+            statusDiv.style.color = "#ff4444";
+            statusDiv.textContent = `❌ ${data.error || "Upload failed"}`;
+          }
+        } catch (err) {
+          statusDiv.style.borderColor = "#ff4444";
+          statusDiv.style.color = "#ff4444";
+          statusDiv.textContent = `❌ Network error: ${err.message}`;
+        }
+
+        // Clear the input so the same file can be re-uploaded
+        input.value = "";
+
+        // Hide status after 5 seconds
+        setTimeout(() => {
+          statusDiv.style.display = "none";
+        }, 5000);
+      }
+      let logsEventSource = null;
+
+      function updateLineCount() {
+        const body = document.getElementById('logs-modal-body');
+        const count = document.getElementById('logs-modal-linecount');
+        const lines = body.innerHTML.split('\n').length;
+        count.textContent = lines + ' line' + (lines !== 1 ? 's' : '');
+      }
+
+      function openLogsModal(agentId, agentName) {
+        const modal = document.getElementById('agent-logs-modal');
+        const body  = document.getElementById('logs-modal-body');
+        const title = document.getElementById('logs-modal-title');
+        const count = document.getElementById('logs-modal-linecount');
+        title.textContent = agentId + '.log';
+        body.innerHTML = '<span style="color:#555;">Loading&hellip;</span>';
+        count.textContent = '';
+        modal.style.display = 'flex';
+
+        authFetch(`/api/agents/${agentId}/logs?lines=200`)
+          .then(r => r.json())
+          .then(data => {
+            const lines = data.logs || [];
+            if (lines.length === 0) {
+              body.innerHTML = '<span style="color:#555;">No log entries found. Run the agent first.</span>';
+              count.textContent = '0 lines';
+              return;
+            }
+            body.innerHTML = lines.map(line => {
+              const escaped = line.replace(/</g, '&lt;').replace(/>/g, '&gt;').trimEnd();
+              if (escaped.includes(' ERROR'))   return `<span style="color:#ff4444;">${escaped}</span>`;
+              if (escaped.includes(' WARNING')) return `<span style="color:#ffaa00;">${escaped}</span>`;
+              return `<span>${escaped}</span>`;
+            }).join('\n');
+            count.textContent = lines.length + ' line' + (lines.length !== 1 ? 's' : '');
+            // Scroll to bottom
+            body.scrollTop = body.scrollHeight;
+          })
+          .catch(err => {
+            body.innerHTML = '<span style="color:#ff4444;">[ERROR] Failed to fetch logs. Is the server running?</span>';
+          });
+
+        const token = localStorage.getItem("auth_token");
+        logsEventSource = new EventSource(`/api/agents/${agentId}/logs/stream?token=${token}`);
+
+        logsEventSource.onmessage = function(event) {
+          const body = document.getElementById("logs-modal-body");
+          const line = event.data;
+
+          // Check scroll BEFORE appending (scrollHeight hasn't changed yet)
+          const isNearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 150;
+
+          // Colour-coded just like the initial render
+          const escaped = line.replace(/</g, "&lt;").replace(/>/g, "&gt;").trimEnd();
+          let html;
+          if (escaped.includes(" ERROR"))
+            html = `<span style="color:#ff4444;">${escaped}</span>`;
+          else if (escaped.includes(" WARNING"))
+            html = `<span style="color:#ffaa00;">${escaped}</span>`;
+          else
+            html = `<span>${escaped}</span>`;
+
+          // Append with insertAdjacentHTML — avoids full innerHTML re-parse
+          body.insertAdjacentHTML("beforeend", "\n" + html);
+
+          // Auto-scroll on next animation frame so the DOM has updated
+          if (isNearBottom) {
+            requestAnimationFrame(() => { body.scrollTop = body.scrollHeight; });
+          }
+
+          // Update line count
+          updateLineCount();
+        };
+
+        logsEventSource.onerror = function () {
+          // Connection lost - EventSource auto-reconnects, nothing to do
+          // Optionally, could show a "Connection lost, retrying..." message if desired
+
+        };
+      }
+
+      function closeLogsModal() {
+        // Close SSE connection when modal closes
+        if (logsEventSource) {
+          logsEventSource.close();
+          logsEventSource = null;
+        }
+        document.getElementById("agent-logs-modal").style.display = "none";
+      }
+
+      // Close on backdrop click
+      document.getElementById('agent-logs-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeLogsModal();
+      });
+
+      // Close on Escape key
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeLogsModal();
+      });
+    </script>
+
+    <!-- Edit Analyst Modal -->
+    <div id="edit-analyst-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center;">
+      <div style="background:#0d1117; border:1px solid #00ff00; border-radius:6px; padding:28px 32px; min-width:340px; font-family:'Share Tech Mono','Courier New',monospace; color:#00ff00;">
+        <h3 style="margin:0 0 6px 0;">✏️ Edit Analyst</h3>
+        <p id="modal-analyst-name" style="margin:0 0 20px 0; color:#64748b; font-size:13px;"></p>
+
+        <div style="display:flex; flex-direction:column; gap:10px; margin-bottom:14px;">
+          <label style="font-size:12px; color:#8cb6ff;">Name</label>
+          <input id="modal-analyst-input-name" type="text"
+            style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;" />
+
+          <label style="font-size:12px; color:#8cb6ff;">Email</label>
+          <input id="modal-analyst-input-email" type="email"
+            style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;" />
+
+          <label style="font-size:12px; color:#8cb6ff;">Role</label>
+          <select id="modal-analyst-input-role"
+            style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;">
+            <option value="analyst">analyst</option>
+            <option value="senior_analyst">senior analyst</option>
+            <option value="manager">manager</option>
+            <option value="admin">admin</option>
+          </select>
+
+          <label style="font-size:12px; color:#8cb6ff;">Notification Threshold</label>
+          <select id="modal-analyst-input-threshold"
+            style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:8px 10px; border-radius:3px; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px;">
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="critical">critical</option>
+          </select>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:12px;">
+          <button onclick="modalSaveDetails()"
+            style="background:#00331a; border:1px solid #00ff00; color:#00ff00; padding:9px 16px; border-radius:3px; cursor:pointer; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; text-align:left;">
+            💾 Save changes
+          </button>
+          <button id="modal-toggle-active-btn" onclick="modalToggleActive()"
+            style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:9px 16px; border-radius:3px; cursor:pointer; font-family:'Share Tech Mono','Courier New',monospace; font-size:13px; text-align:left;">
+          </button>
+          <button onclick="modalResetPassword()"
+            style="background:#1a0a0a; border:1px solid #ff4444; color:#ff4444; padding:9px 16px; border-radius:3px; cursor:pointer; font-family:monospace; font-size:13px; text-align:left;">
+            🔑 Reset password to default
+          </button>
+          <button onclick="closeEditModal()"
+            style="background:transparent; border:1px solid #2a3550; color:#64748b; padding:9px 16px; border-radius:3px; cursor:pointer; font-family:monospace; font-size:13px;">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // Fetch and display logs
+      async function loadLogs() {
+        const response = await authFetch("/api/logs");
+        const data = await response.json();
+        const container = document.getElementById("logs-container");
+        if (data.logs.length === 0) {
+          container.innerHTML = "<p>No logs ingested</p>";
+          return;
+        }
+        let html = `<p>${data.count} logs ingested</p>`;
+        for (const log of data.logs) {
+          html += `<div class="log-card"><pre>${JSON.stringify(log, null, 2)}</pre></div>`;
+        }
+        container.innerHTML = html;
+      }
+      setInterval(loadLogs, 10000);
+      loadLogs();
+
+      function normalizeAnalystRole(role) {
+        const normalized = (role || '').toString().trim().toLowerCase().replace(/\s+/g, '_');
+        const allowedRoles = ['analyst', 'senior_analyst', 'manager', 'admin'];
+        return allowedRoles.includes(normalized) ? normalized : 'analyst';
+      }
+
+      function displayAnalystRole(role) {
+        return normalizeAnalystRole(role).replace(/_/g, ' ');
+      }
+
+      function normalizeNotificationThreshold(threshold) {
+        const normalized = (threshold || '').toString().trim().toLowerCase();
+        const allowedThresholds = ['low', 'medium', 'high', 'critical'];
+        return allowedThresholds.includes(normalized) ? normalized : 'medium';
+      }
+
+      // Fetch and display analysts
+      async function loadAnalysts() {
+        const container = document.getElementById("analysts-container");
+        try {
+          const response = await authFetch("/api/analysts");
+          const data = await response.json();
+          
+          if (!data.analyst || data.analyst.length === 0) {
+            container.innerHTML = "<p>No analysts registered</p>";
+            return;
+          }
+          
+          let html = `<p>${data.analyst.length} analysts registered</p>`;
+          html += `<table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Notification Threshold</th>
+                <th style="border:none; background:#0a0e27;"></th>
+              </tr>
+            </thead>
+            <tbody>`;
+          
+          for (const analyst of data.analyst) {
+            const statusBadge = analyst.active ? '✅ Active' : '❌ Inactive';
+            const escapedName = analyst.name.replace(/'/g, "\\'");
+            const escapedEmail = analyst.email.replace(/'/g, "\\'");
+            const normalizedRole = normalizeAnalystRole(analyst.role);
+            const escapedRole = normalizedRole.replace(/'/g, "\\'");
+            const normalizedThreshold = normalizeNotificationThreshold(analyst.notification_threshold);
+            const escapedThreshold = normalizedThreshold.replace(/'/g, "\\'");
+            html += `<tr>
+              <td>${analyst.name}</td>
+              <td>${analyst.email}</td>
+              <td>${displayAnalystRole(analyst.role)}</td>
+              <td>${statusBadge}</td>
+              <td>${normalizedThreshold}</td>
+              <td style="border:none; background:#0a0e27; padding-left:10px; white-space:nowrap;">
+                <button onclick="openEditModal(${analyst.id}, '${escapedName}', '${escapedEmail}', '${escapedRole}', '${escapedThreshold}', ${analyst.active})"
+                  style="background:#0f1729; border:1px solid #00ff00; color:#00ff00; padding:4px 14px; border-radius:3px; cursor:pointer; font-family:monospace; font-size:12px;">
+                  ✏️ Edit
+                </button>
+              </td>
+            </tr>`;
+          }
+          
+          html += `</tbody></table>`;
+          container.innerHTML = html;
+        } catch (error) {
+          console.error("Failed to load analysts:", error);
+          container.innerHTML = "<p>Failed to load analysts data</p>";
+        }
+      }
+
+      // Load analysts on page load and every 30 seconds
+      loadAnalysts();
+      setInterval(loadAnalysts, 30000);
+
+      let _editAnalystId = null;
+      let _editAnalystActive = null;
+      let _editAnalystName = '';
+      let _editAnalystEmail = '';
+      let _editAnalystRole = 'analyst';
+      let _editAnalystThreshold = 'medium';
+
+      function openEditModal(id, name, email, role, notificationThreshold, active) {
+        _editAnalystId = id;
+        _editAnalystActive = active;
+        _editAnalystName = name;
+        _editAnalystEmail = email;
+        _editAnalystRole = normalizeAnalystRole(role);
+        _editAnalystThreshold = normalizeNotificationThreshold(notificationThreshold);
+        document.getElementById('modal-analyst-name').textContent = name;
+        document.getElementById('modal-analyst-input-name').value = name;
+        document.getElementById('modal-analyst-input-email').value = email;
+        document.getElementById('modal-analyst-input-role').value = _editAnalystRole;
+        document.getElementById('modal-analyst-input-threshold').value = _editAnalystThreshold;
+        document.getElementById('modal-toggle-active-btn').textContent =
+          active ? '🔴 Set as Inactive' : '🟢 Set as Active';
+        const modal = document.getElementById('edit-analyst-modal');
+        modal.style.display = 'flex';
+      }
+
+      function closeEditModal() {
+        document.getElementById('edit-analyst-modal').style.display = 'none';
+        _editAnalystId = null;
+        _editAnalystActive = null;
+        _editAnalystName = '';
+        _editAnalystEmail = '';
+        _editAnalystRole = 'analyst';
+        _editAnalystThreshold = 'medium';
+      }
+
+      async function modalSaveDetails() {
+        if (_editAnalystId === null) return;
+
+        const name = document.getElementById('modal-analyst-input-name').value.trim();
+        const email = document.getElementById('modal-analyst-input-email').value.trim();
+        const role = normalizeAnalystRole(document.getElementById('modal-analyst-input-role').value);
+        const notification_threshold = normalizeNotificationThreshold(document.getElementById('modal-analyst-input-threshold').value);
+
+        if (!name) {
+          alert('Name cannot be empty.');
+          return;
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          alert('Please enter a valid email address.');
+          return;
+        }
+
+        try {
+          const res = await authFetch(`/api/analysts/${_editAnalystId}`, {
+            method: 'PUT',
+            body: JSON.stringify({ name, email, role, notification_threshold }),
+          });
+          const data = await res.json();
+
+          if (data.success) {
+            closeEditModal();
+            loadAnalysts();
+          } else {
+            alert(data.message || 'Update failed.');
+          }
+        } catch (err) {
+          alert('Could not reach server.');
+        }
+      }
+
+      async function modalToggleActive() {
+        if (_editAnalystId === null) return;
+        const newActive = !_editAnalystActive;
+        try {
+          const res = await authFetch(`/api/analysts/${_editAnalystId}`, {
+            method: 'PUT',
+            body: JSON.stringify({ active: newActive }),
+          });
+          const data = await res.json();
+          if (data.success) {
+            closeEditModal();
+            loadAnalysts();
+          } else {
+            alert(data.message || 'Update failed.');
+          }
+        } catch (err) {
+          alert('Could not reach server.');
+        }
+      }
+
+      async function modalResetPassword() {
+        if (_editAnalystId === null) return;
+        const name = document.getElementById('modal-analyst-name').textContent;
+        if (!confirm(`Reset password for ${name}?\n\nThey will receive the default password and be forced to change it on next login.`)) return;
+        try {
+          const res = await authFetch(`/api/analysts/${_editAnalystId}/reset-password`, { method: 'POST' });
+          const data = await res.json();
+          alert(data.message || (data.success ? 'Password reset.' : 'Reset failed.'));
+          closeEditModal();
+        } catch (err) {
+          alert('Could not reach server.');
+        }
+      }
+
+      // --- Auth helpers ---
+
+      function logout() {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('user_role');
+        localStorage.removeItem('user_name');
+        window.location.replace('/login');
+      }
+
+      // Show the logged-in user's name in the header
+      (function initGreeting() {
+        const name = localStorage.getItem('user_name');
+        const role = localStorage.getItem('user_role');
+        if (role !== 'admin') {
+          const item = document.getElementById('menu-analyst-team');
+          if (item) {
+            item.style.display = 'none';
+          }
+        }
+        const el = document.getElementById('user-greeting');
+        if (el && name) {
+          el.textContent = `${name}${role === 'admin' ? ' (Admin)' : ''}`;
+        }
+      })();
+    </script>
+
+  </body>
+</html>

@@ -6,11 +6,15 @@ import json
 from datetime import datetime
 from typing import Dict, Callable
 import threading
+import os
 import redis
 
 
 class RedisMessageBus:
-    def __init__(self, host="localhost", port=6379, db=0):
+    def __init__(self, host=None, port=None, db=None):
+        host = host or os.getenv("REDIS_HOST", "localhost")
+        port = int(port if port is not None else os.getenv("REDIS_PORT", "6379"))
+        db = int(db if db is not None else os.getenv("REDIS_DB", "0"))
         self.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
         self.sub_threads = []
 
